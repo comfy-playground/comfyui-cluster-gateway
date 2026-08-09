@@ -1,0 +1,29 @@
+services:
+  gateway:
+    image: comfyui-gateway-ts:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: comfyui-gateway-ts
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "${GATEWAY_UID:-1000}:${GATEWAY_GID:-1000}"
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-19189}:19189"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      COMFYUI_GATEWAY_CONFIG: /app/config.yaml
+      COMFYUI_GATEWAY_GENERATION_TOKEN: "${COMFYUI_GATEWAY_GENERATION_TOKEN:-}"
+      COMFYUI_GATEWAY_MANAGEMENT_TOKEN: "${COMFYUI_GATEWAY_MANAGEMENT_TOKEN:-}"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
