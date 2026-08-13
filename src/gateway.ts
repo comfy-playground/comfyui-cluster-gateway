@@ -47,6 +47,7 @@ export class GatewayService extends EventEmitter {
   private managerSerial: Promise<void> = Promise.resolve();
   private inventory = new Set<string>();
   private inventoryReady = false;
+  private inventoryRefresh: Promise<void> | undefined;
 
   constructor(readonly config: GatewayConfig, readonly database: GatewayDatabase) {
     super();
@@ -136,7 +137,7 @@ export class GatewayService extends EventEmitter {
     if (![...this.workers.values()].some((worker) => worker.config.enabled && worker.config.capabilities.includes(profile))) {
       throw new GatewayRequestError(503, "no_eligible_worker", `no worker supports profile ${profile}`);
     }
-    this.validateLoras(envelope.prompt);
+    await this.validateLoras(envelope.prompt);
     const id = randomUUID();
     let job: JobRecord;
     const clientId = typeof envelope.client_id === "string" ? envelope.client_id : "";
@@ -168,7 +169,7 @@ export class GatewayService extends EventEmitter {
     return raw as PromptEnvelope;
   }
 
-  private validateLoras(prompt: JsonObject): void {
+  private async validateLoras(prompt: JsonObject): Promise<void> {
     const names: string[] = [];
     for (const node of Object.values(prompt)) {
       if (node === null || typeof node !== "object" || Array.isArray(node)) continue;
@@ -187,13 +188,29 @@ export class GatewayService extends EventEmitter {
         if (typeof lora.name === "string") names.push(lora.name);
       }
     }
+    const normalizedNames: string[] = [];
     for (const name of names) {
       const normalized = name.replaceAll("\\", "/");
       if (name !== normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.split("/").some((part) => part === ".." || part === "")) {
         throw new GatewayRequestError(400, "unsafe_lora_path", `LoRA path is not a normalized relative catalog key: ${name}`);
       }
-      if (!this.inventoryReady) throw new GatewayRequestError(503, "catalog_unavailable", "LoRA catalog is not ready");
-      if (!this.inventory.has(normalized)) throw new GatewayRequestError(400, "unknown_lora", `LoRA is not active in the current catalog: ${normalized}`);
+      normalizedNames.push(normalized);
+    }
+
+    if (!normalizedNames.length) return;
+    if (!this.inventoryReady) throw new GatewayRequestError(503, "catalog_unavailable", "LoRA catalog is not ready");
+
+    let missing = normalizedNames.filter((name) => !this.inventory.has(name));
+    if (missing.length > 0 && this.primary.ready) {
+      try {
+        await this.refreshInventoryOnce();
+        missing = normalizedNames.filter((name) => !this.inventory.has(name));
+      } catch (error) {
+        this.emit("warning", { message: `LoRA inventory refresh during prompt validation failed: ${message(error)}` });
+      }
+    }
+    if (missing.length > 0) {
+      throw new GatewayRequestError(400, "unknown_lora", `LoRA is not active in the current catalog: ${missing[0]}`);
     }
   }
 
@@ -432,6 +449,15 @@ export class GatewayService extends EventEmitter {
     }
     this.inventory = next;
     this.inventoryReady = true;
+  }
+
+  private async refreshInventoryOnce(): Promise<void> {
+    if (!this.inventoryRefresh) {
+      this.inventoryRefresh = this.refreshInventory().finally(() => {
+        this.inventoryRefresh = undefined;
+      });
+    }
+    await this.inventoryRefresh;
   }
 
   beginManagerOperation(scope: string, idempotencyKey: string, method: string, path: string, body: Uint8Array, requestTarget = path): { operation: CatalogOperation; created: boolean; conflict: boolean } {

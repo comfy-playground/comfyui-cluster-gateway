@@ -328,4 +328,17 @@ describe("ComfyUI gateway black-box flow", () => {
     const blocked = await gatewayFetch(running, "/api/lm/not-allowlisted", {}, true);
     expect(blocked.status).toBe(403);
   });
+
+  it("refreshes the primary inventory once before rejecting an unknown LoRA", async () => {
+    const { running, primary } = await fixture();
+    const prompt = { "23": { class_type: "Lora Loader (LoraManager)", inputs: { loras: { __value__: [{ name: "late/downloaded.safetensors", active: true }] } } } };
+    primary.activeLoras.add("late/downloaded.safetensors");
+
+    const response = await gatewayFetch(running, "/prompt", {
+      method: "POST",
+      body: JSON.stringify({ prompt }),
+    });
+
+    expect(response.status).toBe(200);
+  });
 });
