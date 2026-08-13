@@ -325,7 +325,14 @@ export class GatewayService extends EventEmitter {
         return;
       }
       if (job.submittedAtMs && Date.now() - job.submittedAtMs > this.config.timeouts.maxJobRuntimeMs) {
-        this.database.markUncertain(job.id, "job exceeded maximum runtime and backend state is unknown");
+        this.database.markTerminal(
+          job.id,
+          "failed",
+          JSON.stringify(errorHistory(job.id, "job exceeded maximum runtime and no longer exists in backend history or queue")),
+          "backend_state_lost",
+          "job exceeded maximum runtime and no longer exists in backend history or queue",
+        );
+        this.releaseWorker(worker);
       }
     } catch (error) {
       worker.ready = false;
