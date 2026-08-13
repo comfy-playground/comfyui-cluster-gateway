@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
-import type { CatalogOperation, JobRecord, JobStatus, OutputRecord } from "./types.js";
+import type { JobRecord, JobStatus, OutputRecord } from "./types.js";
 
 type Row = Record<string, SQLOutputValue>;
 
@@ -19,17 +19,6 @@ function jobFrom(row: Row): JobRecord {
     createdAtMs: num(row.created_at_ms), updatedAtMs: num(row.updated_at_ms),
     submittedAtMs: row.submitted_at_ms === null ? null : num(row.submitted_at_ms),
     completedAtMs: row.completed_at_ms === null ? null : num(row.completed_at_ms),
-  };
-}
-
-function operationFrom(row: Row): CatalogOperation {
-  const body = row.response_body;
-  return {
-    id: str(row.id), scope: str(row.scope), idempotencyKey: str(row.idempotency_key), requestHash: str(row.request_hash),
-    method: str(row.method), path: str(row.path), kind: str(row.kind), status: str(row.status), revision: num(row.revision),
-    responseStatus: num(row.response_status), responseContentType: str(row.response_content_type),
-    responseBody: body instanceof Uint8Array ? body : new Uint8Array(), errorCode: str(row.error_code), errorMessage: str(row.error_message),
-    createdAtMs: num(row.created_at_ms), updatedAtMs: num(row.updated_at_ms),
   };
 }
 
@@ -96,25 +85,6 @@ export class GatewayDatabase {
         state TEXT NOT NULL DEFAULT 'stale',
         last_error TEXT NOT NULL DEFAULT '',
         updated_at_ms INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS management_operations (
-        id TEXT PRIMARY KEY,
-        scope TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        request_hash TEXT NOT NULL,
-        method TEXT NOT NULL,
-        path TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        status TEXT NOT NULL,
-        revision INTEGER NOT NULL DEFAULT 0,
-        response_status INTEGER NOT NULL DEFAULT 0,
-        response_content_type TEXT NOT NULL DEFAULT '',
-        response_body BLOB,
-        error_code TEXT NOT NULL DEFAULT '',
-        error_message TEXT NOT NULL DEFAULT '',
-        created_at_ms INTEGER NOT NULL,
-        updated_at_ms INTEGER NOT NULL,
-        UNIQUE(scope,idempotency_key)
       );
       CREATE TABLE IF NOT EXISTS generation_idempotency (
         scope TEXT NOT NULL,
@@ -286,44 +256,6 @@ export class GatewayDatabase {
     this.db.prepare(`INSERT INTO worker_catalog(worker_id,applied_revision,state,last_error,updated_at_ms) VALUES(?,?,?,?,?)
       ON CONFLICT(worker_id) DO UPDATE SET applied_revision=excluded.applied_revision,state=excluded.state,last_error=excluded.last_error,updated_at_ms=excluded.updated_at_ms`)
       .run(workerId, revision, state, lastError, Date.now());
-  }
-
-  beginOperation(scope: string, idempotencyKey: string, requestHash: string, method: string, path: string, kind: string): { operation: CatalogOperation; created: boolean; conflict: boolean } {
-    const existing = this.db.prepare("SELECT * FROM management_operations WHERE scope=? AND idempotency_key=?").get(scope, idempotencyKey);
-    if (existing) {
-      const operation = operationFrom(existing);
-      return { operation, created: false, conflict: operation.requestHash !== requestHash || operation.method !== method || operation.path !== path };
-    }
-    const id = randomUUID();
-    const now = Date.now();
-    this.db.prepare("INSERT INTO management_operations(id,scope,idempotency_key,request_hash,method,path,kind,status,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,'pending',?,?)")
-      .run(id, scope, idempotencyKey, requestHash, method, path, kind, now, now);
-    const operation = this.getOperation(id);
-    if (!operation) throw new Error("inserted operation disappeared");
-    return { operation, created: true, conflict: false };
-  }
-
-  getOperation(id: string): CatalogOperation | undefined {
-    const row = this.db.prepare("SELECT * FROM management_operations WHERE id=?").get(id);
-    return row ? operationFrom(row) : undefined;
-  }
-
-  markOperationRunning(id: string): void {
-    this.db.prepare("UPDATE management_operations SET status='running',updated_at_ms=? WHERE id=? AND status='pending'").run(Date.now(), id);
-  }
-
-  completeOperation(id: string, revision: number, responseStatus: number, contentType: string, body: Uint8Array): void {
-    this.db.prepare("UPDATE management_operations SET status='succeeded',revision=?,response_status=?,response_content_type=?,response_body=?,updated_at_ms=? WHERE id=?")
-      .run(revision, responseStatus, contentType, body, Date.now(), id);
-  }
-
-  failOperation(id: string, code: string, message: string, status = "failed"): void {
-    this.db.prepare("UPDATE management_operations SET status=?,error_code=?,error_message=?,updated_at_ms=? WHERE id=?")
-      .run(status, code, message, Date.now(), id);
-  }
-
-  listUnfinishedOperations(): CatalogOperation[] {
-    return this.db.prepare("SELECT * FROM management_operations WHERE status IN ('pending','running','uncertain') ORDER BY created_at_ms").all().map(operationFrom);
   }
 
   terminalStorage(): Array<{ id: string; completedAtMs: number; sizeBytes: number }> {

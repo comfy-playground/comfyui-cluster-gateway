@@ -313,7 +313,7 @@ describe("ComfyUI gateway black-box flow", () => {
     expect((await gatewayFetch(running, "/prompt", { method: "POST", body: JSON.stringify({ prompt: knownPrompt }) })).status).toBe(200);
 
     primary.managerCalls.length = 0; fast.managerCalls.length = 0;
-    const mutation = await gatewayFetch(running, "/api/lm/loras/exclude", { method: "POST", headers: { "x-idempotency-key": "exclude-1" }, body: JSON.stringify({ file_path: "characters/test.safetensors" }) }, true);
+    const mutation = await gatewayFetch(running, "/api/lm/loras/exclude", { method: "POST", body: JSON.stringify({ file_path: "characters/test.safetensors" }) }, true);
     expect(mutation.status).toBe(200);
     expect(mutation.headers.get("x-comfy-gateway-catalog-revision")).toBe("1");
     expect(primary.managerCalls.some((call) => call === "POST /api/lm/loras/exclude")).toBe(true);
@@ -322,9 +322,9 @@ describe("ComfyUI gateway black-box flow", () => {
     const workers = await (await gatewayFetch(running, "/gateway/v1/workers")).json() as { workers: Array<{ appliedRevision: number }>; catalog_revision: number };
     expect(workers.catalog_revision).toBe(1);
     expect(workers.workers.every((worker) => worker.appliedRevision === 1)).toBe(true);
-    const replay = await gatewayFetch(running, "/api/lm/loras/exclude", { method: "POST", headers: { "x-idempotency-key": "exclude-1" }, body: JSON.stringify({ file_path: "characters/test.safetensors" }) }, true);
-    expect(replay.status).toBe(200);
-    expect(primary.managerCalls.filter((call) => call === "POST /api/lm/loras/exclude")).toHaveLength(1);
+    const repeat = await gatewayFetch(running, "/api/lm/loras/exclude", { method: "POST", body: JSON.stringify({ file_path: "characters/test.safetensors" }) }, true);
+    expect(repeat.status).toBe(200);
+    expect(primary.managerCalls.filter((call) => call === "POST /api/lm/loras/exclude")).toHaveLength(2);
     const blocked = await gatewayFetch(running, "/api/lm/not-allowlisted", {}, true);
     expect(blocked.status).toBe(403);
   });

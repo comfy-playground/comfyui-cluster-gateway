@@ -6,7 +6,7 @@ import type { GatewayDatabase } from "./database.js";
 import { errorHistory } from "./database.js";
 import { OutputStore } from "./output-store.js";
 import { assignJobs, profileAndCost } from "./scheduler.js";
-import type { CatalogOperation, GatewayConfig, JsonObject, JobRecord, JobStatus, PromptEnvelope, WorkerConfig, WorkerSnapshot, WorkerState } from "./types.js";
+import type { GatewayConfig, JsonObject, JobRecord, JobStatus, PromptEnvelope, WorkerConfig, WorkerSnapshot, WorkerState } from "./types.js";
 import { readResponseBytes, UpstreamHttpError, WorkerClient } from "./worker-client.js";
 
 interface WorkerRuntime {
@@ -24,7 +24,6 @@ interface WorkerRuntime {
 }
 
 export interface ManagerResult {
-  operationId: string;
   status: number;
   contentType: string;
   body: Uint8Array;
@@ -68,12 +67,6 @@ export class GatewayService extends EventEmitter {
 
   async start(): Promise<void> {
     await this.outputStore.initialize();
-    for (const operation of this.database.listUnfinishedOperations()) {
-      const uncertain = operation.status !== "pending";
-      this.database.failOperation(operation.id, "gateway_restarted_during_operation",
-        uncertain ? "gateway restarted after the control operation may have started; reconcile catalog before retrying" : "gateway restarted before the control operation started",
-        uncertain ? "uncertain" : "failed");
-    }
     const revision = this.database.catalogRevision();
     await Promise.all([...this.workers.values()].filter((worker) => worker.config.enabled).map(async (worker) => {
       try {
@@ -460,46 +453,29 @@ export class GatewayService extends EventEmitter {
     await this.inventoryRefresh;
   }
 
-  beginManagerOperation(scope: string, idempotencyKey: string, method: string, path: string, body: Uint8Array, requestTarget = path): { operation: CatalogOperation; created: boolean; conflict: boolean } {
-    const hash = createHash("sha256").update(method).update("\n").update(requestTarget).update("\n").update(body).digest("hex");
-    const kind = path === "/api/lm/download-model" ? "download" : path === "/api/lm/loras/scan" ? "reconcile" : "catalog_mutation";
-    return this.database.beginOperation(scope, idempotencyKey, hash, method, path, kind);
-  }
-
-  getManagerOperation(id: string): CatalogOperation | undefined { return this.database.getOperation(id); }
-
-  async runManagerOperation(operation: CatalogOperation, rawPathAndQuery: string, body: Uint8Array, contentType: string | undefined): Promise<ManagerResult> {
+  async runCatalogMutation(rawPathAndQuery: string, method: string, body: Uint8Array, contentType: string | undefined): Promise<ManagerResult> {
     let release!: () => void;
     const previous = this.managerSerial;
     this.managerSerial = new Promise<void>((resolvePromise) => { release = resolvePromise; });
     await previous;
-    this.database.markOperationRunning(operation.id);
-    const isDownload = operation.path === "/api/lm/download-model";
-    const isScan = operation.path === "/api/lm/loras/scan";
+    const parsedRequest = new URL(rawPathAndQuery, "http://gateway.invalid");
+    const isScan = parsedRequest.pathname === "/api/lm/loras/scan";
     let upstream: Response | undefined;
     let responseBody: Uint8Array<ArrayBufferLike> = new Uint8Array();
     let responseContentType = "application/json";
     try {
-      if (!isDownload) {
-        this.dispatchPaused = true;
-        await this.waitForDrain();
-      }
+      this.dispatchPaused = true;
+      await this.waitForDrain();
       let upstreamPath = rawPathAndQuery;
       if (isScan) {
-        const parsed = new URL(rawPathAndQuery, "http://gateway.invalid");
-        parsed.searchParams.set("full_rebuild", "true");
-        upstreamPath = `${parsed.pathname}${parsed.search}`;
+        parsedRequest.searchParams.set("full_rebuild", "true");
+        upstreamPath = `${parsedRequest.pathname}${parsedRequest.search}`;
       }
-      upstream = await this.primary.client.proxy(upstreamPath, operation.method, body.byteLength > 0 ? body : undefined, contentType, isDownload);
+      upstream = await this.primary.client.proxy(upstreamPath, method, body.byteLength > 0 ? body : undefined, contentType, false);
       responseBody = await readResponseBytes(upstream, 16 * 1024 * 1024);
       responseContentType = upstream.headers.get("content-type") ?? "application/json";
       if (!upstream.ok) {
-        this.database.completeOperation(operation.id, this.catalogRevision(), upstream.status, responseContentType, responseBody);
-        return { operationId: operation.id, status: upstream.status, contentType: responseContentType, body: responseBody, revision: this.catalogRevision(), optionalUnavailable: [] };
-      }
-      if (isDownload) {
-        this.dispatchPaused = true;
-        await this.waitForDrain();
+        return { status: upstream.status, contentType: responseContentType, body: responseBody, revision: this.catalogRevision(), optionalUnavailable: [] };
       }
       const revision = this.database.advanceCatalogRevision();
       for (const worker of this.workers.values()) {
@@ -524,13 +500,10 @@ export class GatewayService extends EventEmitter {
         }
       }
       await this.refreshInventory();
-      this.database.completeOperation(operation.id, revision, upstream.status, responseContentType, responseBody);
-      return { operationId: operation.id, status: upstream.status, contentType: responseContentType, body: responseBody, revision, optionalUnavailable };
+      return { status: upstream.status, contentType: responseContentType, body: responseBody, revision, optionalUnavailable };
     } catch (error) {
       const code = upstream?.ok ? "catalog_barrier_failed" : "catalog_operation_failed";
-      const status = upstream?.ok ? "uncertain" : "failed";
-      this.database.failOperation(operation.id, code, message(error), status);
-      throw new GatewayRequestError(503, code, message(error), operation.id);
+      throw new GatewayRequestError(503, code, message(error));
     } finally {
       this.dispatchPaused = false;
       this.replanQueued();

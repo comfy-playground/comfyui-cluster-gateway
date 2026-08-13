@@ -1,8 +1,8 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { GatewayRequestError, type GatewayService, type ManagerResult } from "./gateway.js";
-import type { CatalogOperation, GatewayConfig, JobRecord } from "./types.js";
+import type { GatewayConfig, JobRecord } from "./types.js";
 import { readResponseBytes } from "./worker-client.js";
 
 function bearer(header: string | undefined, expected: string): boolean {
@@ -40,14 +40,13 @@ function readAllowed(path: string): boolean {
 
 function mutationAllowed(method: string, path: string): boolean {
   return (method === "GET" && path === "/api/lm/loras/scan") ||
-    (method === "POST" && ["/api/lm/download-model", "/api/lm/loras/exclude", "/api/lm/loras/unexclude"].includes(path));
+    (method === "POST" && ["/api/lm/loras/exclude", "/api/lm/loras/unexclude"].includes(path));
 }
 
 export async function buildServer(gateway: GatewayService, config: GatewayConfig): Promise<FastifyInstance> {
   const app = Fastify({ logger: process.env.NODE_ENV !== "test", bodyLimit: config.limits.maxPromptBytes, requestTimeout: 0 });
   await app.register(websocket, { options: { maxPayload: 64 * 1024 } });
   const sockets = new Set<{ readonly OPEN: number; readonly readyState: number; send(data: string): void }>();
-  const managementScope = createHash("sha256").update(config.auth.managementToken).digest("hex").slice(0, 16);
 
   app.addHook("onRequest", async (request, reply) => {
     const path = request.url.split("?", 1)[0] ?? request.url;
@@ -129,12 +128,6 @@ export async function buildServer(gateway: GatewayService, config: GatewayConfig
     if (!job) return reply.code(404).send(errorBody("job_not_found", "gateway job was not found"));
     return job;
   });
-  app.get("/gateway/v1/catalog/operations/:id", async (request, reply) => {
-    const operation = gateway.getManagerOperation((request.params as { id: string }).id);
-    if (!operation) return reply.code(404).send(errorBody("operation_not_found", "catalog operation was not found"));
-    return operationJson(operation);
-  });
-
   app.get("/ws", { websocket: true }, (socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -147,11 +140,11 @@ export async function buildServer(gateway: GatewayService, config: GatewayConfig
   });
   gateway.on("warning", (event: Record<string, unknown>) => app.log.warn(event));
 
-  app.all("/api/lm/*", async (request, reply) => handleManager(request, reply, gateway, managementScope));
+  app.all("/api/lm/*", async (request, reply) => handleManager(request, reply, gateway));
   return app;
 }
 
-async function handleManager(request: FastifyRequest, reply: FastifyReply, gateway: GatewayService, scope: string): Promise<unknown> {
+async function handleManager(request: FastifyRequest, reply: FastifyReply, gateway: GatewayService): Promise<unknown> {
   const path = request.url.split("?", 1)[0] ?? request.url;
   const method = request.method;
   if (["/api/lm/pause-download", "/api/lm/resume-download", "/api/lm/cancel-download-get"].includes(path)) {
@@ -167,35 +160,15 @@ async function handleManager(request: FastifyRequest, reply: FastifyReply, gatew
     return reply.send(Buffer.from(body));
   }
   if (!mutationAllowed(method, path)) return reply.code(403).send(errorBody("manager_route_not_allowed", "management method and path are not allowlisted"));
-  const idempotencyKey = typeof request.headers["x-idempotency-key"] === "string" ? request.headers["x-idempotency-key"].trim() : "";
-  if (!idempotencyKey || idempotencyKey.length > 128) return reply.code(400).send(errorBody("idempotency_key_required", "X-Idempotency-Key is required and must not exceed 128 characters"));
   const bytes = bodyBytes(request.body);
-  const result = gateway.beginManagerOperation(scope, idempotencyKey, method, path, bytes, request.url);
-  if (result.conflict) return reply.code(409).send(errorBody("idempotency_conflict", "idempotency key was already used for a different request", result.operation.id));
-  if (!result.created) return replayOperation(reply, result.operation);
-  const managerResult = await gateway.runManagerOperation(result.operation, request.url, bytes, request.headers["content-type"]);
+  const managerResult = await gateway.runCatalogMutation(request.url, method, bytes, request.headers["content-type"]);
   return sendManagerResult(reply, managerResult);
 }
 
 function sendManagerResult(reply: FastifyReply, result: ManagerResult): unknown {
   reply.code(result.status).header("content-type", result.contentType)
-    .header("x-comfy-gateway-operation-id", result.operationId)
     .header("x-comfy-gateway-catalog-revision", result.revision)
     .header("x-comfy-gateway-catalog-sync", "ready");
   if (result.optionalUnavailable.length > 0) reply.header("x-comfy-gateway-optional-unavailable-workers", result.optionalUnavailable.join(","));
   return reply.send(Buffer.from(result.body));
-}
-
-function replayOperation(reply: FastifyReply, operation: CatalogOperation): unknown {
-  if (operation.status === "succeeded") return sendManagerResult(reply, { operationId: operation.id, status: operation.responseStatus, contentType: operation.responseContentType, body: operation.responseBody, revision: operation.revision, optionalUnavailable: [] });
-  if (["pending", "running"].includes(operation.status)) return reply.code(202).send({ operation_id: operation.id, status: operation.status });
-  return reply.code(503).send(errorBody(operation.errorCode || "catalog_operation_failed", operation.errorMessage || `operation is ${operation.status}`, operation.id));
-}
-
-function operationJson(operation: CatalogOperation): Record<string, unknown> {
-  return {
-    id: operation.id, status: operation.status, kind: operation.kind, method: operation.method, path: operation.path,
-    revision: operation.revision, response_status: operation.responseStatus, error_code: operation.errorCode,
-    error_message: operation.errorMessage, created_at_ms: operation.createdAtMs, updated_at_ms: operation.updatedAtMs,
-  };
 }

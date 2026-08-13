@@ -100,25 +100,6 @@ export interface WorkerSnapshot {
   deviceName: string;
 }
 
-export interface CatalogOperation {
-  id: string;
-  scope: string;
-  idempotencyKey: string;
-  requestHash: string;
-  method: string;
-  path: string;
-  kind: string;
-  status: string;
-  revision: number;
-  responseStatus: number;
-  responseContentType: string;
-  responseBody: Uint8Array;
-  errorCode: string;
-  errorMessage: string;
-  createdAtMs: number;
-  updatedAtMs: number;
-}
-
 export interface PromptEnvelope extends JsonObject {
   prompt: JsonObject;
   client_id?: string;
