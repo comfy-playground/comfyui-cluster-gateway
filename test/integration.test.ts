@@ -198,7 +198,7 @@ async function fixture(primaryOnline = true, fastOnline = true): Promise<{ root:
 }
 
 describe("ComfyUI gateway black-box flow", () => {
-  it("assigns six simultaneous images 4:2 by earliest predicted completion and serves collected output", async () => {
+  it("lets whichever worker finishes first consume the next queued image", async () => {
     const { running } = await fixture();
     const ids = await Promise.all(Array.from({ length: 6 }, () => submit(running)));
     await Promise.all(ids.map((id) => terminalHistory(running, id)));
@@ -208,7 +208,7 @@ describe("ComfyUI gateway black-box flow", () => {
       jobs.push((await response.json()) as { number: number; workerId: string });
     }
     const workers = jobs.sort((left, right) => left.number - right.number).map((job) => job.workerId);
-    expect(workers).toEqual(["rtx3090-worker", "rtx3090-worker", "a3000-control", "rtx3090-worker", "rtx3090-worker", "a3000-control"]);
+    expect(workers).toEqual(["rtx3090-worker", "a3000-control", "rtx3090-worker", "rtx3090-worker", "a3000-control", "rtx3090-worker"]);
     const history = await terminalHistory(running, ids[0]!);
     const entry = history[ids[0]!] as { outputs: Record<string, { images: Array<{ filename: string; subfolder: string; type: string }> }> };
     const image = entry.outputs["9"]!.images[0]!;

@@ -148,24 +148,15 @@ export class GatewayDatabase {
     return this.db.prepare(`SELECT * FROM jobs WHERE status IN (${placeholders}) ORDER BY number`).all(...statuses).map(jobFrom);
   }
 
-  assignJob(id: string, workerId: string, predictedDurationMs: number): boolean {
-    return this.db.prepare("UPDATE jobs SET worker_id=?,predicted_duration_ms=?,updated_at_ms=? WHERE id=? AND status='queued'")
-      .run(workerId, predictedDurationMs, Date.now(), id).changes === 1;
-  }
-
-  clearQueuedAssignments(): void {
-    this.db.prepare("UPDATE jobs SET worker_id='',predicted_duration_ms=0,updated_at_ms=? WHERE status='queued'").run(Date.now());
-  }
-
-  claimQueued(workerId: string): JobRecord | undefined {
+  claimQueued(id: string, workerId: string, predictedDurationMs: number): JobRecord | undefined {
     return this.transaction(() => {
       const busyPlaceholders = IN_FLIGHT.map(() => "?").join(",");
-      const row = this.db.prepare(`SELECT * FROM jobs WHERE status='queued' AND worker_id=? AND NOT EXISTS (
+      const row = this.db.prepare(`SELECT * FROM jobs WHERE id=? AND status='queued' AND NOT EXISTS (
         SELECT 1 FROM jobs active WHERE active.worker_id=? AND active.status IN (${busyPlaceholders})
-      ) ORDER BY number LIMIT 1`).get(workerId, workerId, ...IN_FLIGHT);
+      )`).get(id, workerId, ...IN_FLIGHT);
       if (!row) return undefined;
-      const id = str(row.id);
-      const changed = this.db.prepare("UPDATE jobs SET status='dispatching',updated_at_ms=? WHERE id=? AND status='queued'").run(Date.now(), id).changes;
+      const changed = this.db.prepare("UPDATE jobs SET status='dispatching',worker_id=?,predicted_duration_ms=?,updated_at_ms=? WHERE id=? AND status='queued'")
+        .run(workerId, predictedDurationMs, Date.now(), id).changes;
       return changed === 1 ? this.getJob(id) : undefined;
     });
   }

@@ -5,7 +5,7 @@ import { createReadStream } from "node:fs";
 import type { GatewayDatabase } from "./database.js";
 import { errorHistory } from "./database.js";
 import { OutputStore } from "./output-store.js";
-import { assignJobs, profileAndCost } from "./scheduler.js";
+import { profileAndCost } from "./scheduler.js";
 import type { GatewayConfig, JsonObject, JobRecord, JobStatus, PromptEnvelope, WorkerConfig, WorkerSnapshot, WorkerState } from "./types.js";
 import { readResponseBytes, UpstreamHttpError, WorkerClient } from "./worker-client.js";
 
@@ -147,7 +147,6 @@ export class GatewayService extends EventEmitter {
       if (message(error) === "idempotency_conflict") throw new GatewayRequestError(409, "idempotency_conflict", "idempotency key was already used for a different prompt");
       throw error;
     }
-    this.replanQueued();
     this.emit("job", { type: "status", jobId: id, status: "queued" });
     void this.tick();
     return this.database.getJob(id) ?? job;
@@ -211,37 +210,6 @@ export class GatewayService extends EventEmitter {
     return worker.ewmaSamples >= this.config.scheduler.ewmaMinSamples && worker.ewmaMs > 0 ? worker.ewmaMs / 1000 : worker.config.secondsPerImage;
   }
 
-  private replanQueued(): void {
-    if (this.dispatchPaused) return;
-    const now = Date.now();
-    const queued = this.database.listJobs(["queued"]);
-    this.database.clearQueuedAssignments();
-    const workers = [...this.workers.values()].map((worker) => {
-      let availableInSeconds = 0;
-      if (worker.currentJobId) {
-        const current = this.database.getJob(worker.currentJobId);
-        if (current?.submittedAtMs) {
-          const elapsed = Math.max(0, now - current.submittedAtMs);
-          availableInSeconds = elapsed < current.predictedDurationMs
-            ? (current.predictedDurationMs - elapsed) / 1000
-            : Math.max(this.config.timeouts.historyPollMs / 1000, elapsed / 1000 * 0.2);
-        } else availableInSeconds = this.effectiveSeconds(worker);
-      }
-      return {
-        id: worker.config.id,
-        eligible: worker.config.enabled && worker.ready && !this.dispatchPaused,
-        secondsPerImage: this.effectiveSeconds(worker), availableInSeconds,
-        capabilities: new Set(worker.config.capabilities),
-      };
-    });
-    const assignments = assignJobs(workers, queued.map((job) => {
-      const envelope = JSON.parse(job.requestJson) as Record<string, unknown>;
-      const profile = profileAndCost(envelope);
-      return { id: job.id, ...profile };
-    }), this.config.scheduler.tieEpsilonMs / 1000);
-    for (const assignment of assignments) this.database.assignJob(assignment.jobId, assignment.workerId, assignment.predictedDurationMs);
-  }
-
   private async tick(): Promise<void> {
     if (this.ticking || this.stopped) return;
     this.ticking = true;
@@ -253,8 +221,10 @@ export class GatewayService extends EventEmitter {
       }));
       await Promise.all([...this.workers.values()].filter((worker) => worker.currentJobId !== "").map((worker) => this.reconcileWorker(worker)));
       if (!this.dispatchPaused) {
-        this.replanQueued();
-        await Promise.all([...this.workers.values()].filter((worker) => worker.ready && !worker.currentJobId).map((worker) => this.dispatchWorker(worker)));
+        const idleWorkers = [...this.workers.values()]
+          .filter((worker) => worker.ready && !worker.currentJobId)
+          .sort((left, right) => this.effectiveSeconds(left) - this.effectiveSeconds(right));
+        await Promise.all(idleWorkers.map((worker) => this.dispatchWorker(worker)));
       }
     } finally { this.ticking = false; }
   }
@@ -288,7 +258,19 @@ export class GatewayService extends EventEmitter {
   }
 
   private async dispatchWorker(worker: WorkerRuntime): Promise<void> {
-    const job = this.database.claimQueued(worker.config.id);
+    const queued = this.database.listJobs(["queued"]);
+    let job: JobRecord | undefined;
+    for (const candidate of queued) {
+      const envelope = JSON.parse(candidate.requestJson) as Record<string, unknown>;
+      const { profile, costFactor } = profileAndCost(envelope);
+      if (!worker.config.capabilities.includes(profile)) continue;
+      job = this.database.claimQueued(
+        candidate.id,
+        worker.config.id,
+        Math.round(this.effectiveSeconds(worker) * costFactor * 1000),
+      );
+      if (job) break;
+    }
     if (!job) return;
     worker.currentJobId = job.id;
     worker.state = "busy";
@@ -382,7 +364,6 @@ export class GatewayService extends EventEmitter {
   private releaseWorker(worker: WorkerRuntime): void {
     worker.currentJobId = "";
     worker.state = worker.ready ? "ready" : "offline";
-    this.replanQueued();
   }
 
   private async recoverJobs(): Promise<void> {
@@ -396,7 +377,6 @@ export class GatewayService extends EventEmitter {
       worker.currentJobId = job.id;
       if (worker.ready) worker.state = "busy";
     }
-    this.replanQueued();
   }
 
   async cancel(id: string): Promise<{ cancelled: boolean; state: string }> {
@@ -404,7 +384,6 @@ export class GatewayService extends EventEmitter {
     if (!job) throw new GatewayRequestError(404, "job_not_found", "gateway job was not found");
     if (job.status === "queued") {
       const cancelled = this.database.cancelQueued(id);
-      this.replanQueued();
       return { cancelled, state: cancelled ? "cancelled" : this.database.getJob(id)?.status ?? job.status };
     }
     if (["submitted", "running", "uncertain"].includes(job.status)) {
@@ -506,7 +485,6 @@ export class GatewayService extends EventEmitter {
       throw new GatewayRequestError(503, code, message(error));
     } finally {
       this.dispatchPaused = false;
-      this.replanQueued();
       release();
       void this.tick();
     }
