@@ -19,4 +19,3 @@ export function analyzeBatchCandidate(envelope: PromptEnvelope): BatchCandidate 
 export function mergeBatchCandidates(candidates: readonly BatchCandidate[], executionId: string): PromptEnvelope {
   return legacyAdapter.merge(candidates, executionId).envelope;
 }
-

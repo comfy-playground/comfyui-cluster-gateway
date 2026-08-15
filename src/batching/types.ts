@@ -51,4 +51,3 @@ export interface BatchAdapter {
   merge(candidates: readonly BatchCandidate[], executionId: string): PhysicalBatch;
   splitHistory(history: JsonObject, plan: BatchPlan, executionId: string, jobId: string, memberIndex: number): JsonObject;
 }
-

@@ -28,4 +28,3 @@ export class BatchAdapterRegistry {
     return adapter.requiredBackendNodes.every((node) => availableNodes.has(node));
   }
 }
-
