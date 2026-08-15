@@ -2,11 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { ReadStream } from "node:fs";
 import { createReadStream } from "node:fs";
+import { createBatchAdapters } from "./batching/adapters.js";
+import { BatchAdapterRegistry } from "./batching/registry.js";
+import type { BatchAdapter, BatchCandidate, BatchPlan } from "./batching/types.js";
 import type { GatewayDatabase } from "./database.js";
 import { errorHistory } from "./database.js";
-import { OutputStore } from "./output-store.js";
+import { historyForMember, OutputStore } from "./output-store.js";
 import { profileAndCost } from "./scheduler.js";
-import type { GatewayConfig, JsonObject, JobRecord, JobStatus, PromptEnvelope, WorkerConfig, WorkerSnapshot, WorkerState } from "./types.js";
+import type { ExecutionRecord, GatewayConfig, JsonObject, JobRecord, JobStatus, PromptEnvelope, WorkerConfig, WorkerSnapshot, WorkerState } from "./types.js";
 import { readResponseBytes, UpstreamHttpError, WorkerClient } from "./worker-client.js";
 
 interface WorkerRuntime {
@@ -14,13 +17,17 @@ interface WorkerRuntime {
   client: WorkerClient;
   state: WorkerState;
   ready: boolean;
-  currentJobId: string;
+  currentExecutionId: string;
+  batchCapable: boolean;
+  batchAdapters: Set<string>;
   appliedRevision: number;
   lastError: string;
   deviceName: string;
   ewmaMs: number;
   ewmaSamples: number;
   nextProbeAt: number;
+  lastProbeAt: number;
+  lastSystemStats: JsonObject;
 }
 
 export interface ManagerResult {
@@ -38,8 +45,11 @@ export class GatewayService extends EventEmitter {
   readonly workers = new Map<string, WorkerRuntime>();
   readonly outputStore: OutputStore;
   readonly primary: WorkerRuntime;
+  readonly batchRegistry: BatchAdapterRegistry;
   private timer: NodeJS.Timeout | undefined;
   private retentionTimer: NodeJS.Timeout | undefined;
+  private batchWakeTimer: NodeJS.Timeout | undefined;
+  private batchWakeAt = 0;
   private ticking = false;
   private stopped = false;
   private dispatchPaused = false;
@@ -50,13 +60,15 @@ export class GatewayService extends EventEmitter {
 
   constructor(readonly config: GatewayConfig, readonly database: GatewayDatabase) {
     super();
+    this.batchRegistry = new BatchAdapterRegistry(createBatchAdapters().filter((adapter) => config.batching.adapters?.[adapter.id] !== false));
     for (const workerConfig of config.workers) {
       const stats = database.workerStats(workerConfig.id);
       this.workers.set(workerConfig.id, {
         config: workerConfig,
         client: new WorkerClient(workerConfig.url, config.timeouts.workerRequestMs),
-        state: workerConfig.enabled ? "offline" : "disabled", ready: false, currentJobId: "", appliedRevision: 0,
+        state: workerConfig.enabled ? "offline" : "disabled", ready: false, currentExecutionId: "", batchCapable: false, batchAdapters: new Set(), appliedRevision: 0,
         lastError: "not probed", deviceName: "", ewmaMs: stats.ewmaMs, ewmaSamples: stats.samples, nextProbeAt: 0,
+        lastProbeAt: 0, lastSystemStats: {},
       });
     }
     const primary = [...this.workers.values()].find((worker) => worker.config.enabled && worker.config.primary);
@@ -94,6 +106,7 @@ export class GatewayService extends EventEmitter {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     if (this.retentionTimer) clearInterval(this.retentionTimer);
+    if (this.batchWakeTimer) clearTimeout(this.batchWakeTimer);
     while (this.ticking) await sleep(5);
   }
 
@@ -108,8 +121,14 @@ export class GatewayService extends EventEmitter {
 
   workerSnapshots(): WorkerSnapshot[] {
     return [...this.workers.values()].map((worker) => ({
-      id: worker.config.id, state: worker.state, ready: worker.ready, busy: worker.currentJobId !== "",
-      required: worker.config.required, primary: worker.config.primary, currentJobId: worker.currentJobId,
+      id: worker.config.id, state: worker.state, ready: worker.ready, busy: worker.currentExecutionId !== "",
+      required: worker.config.required, primary: worker.config.primary,
+      currentJobId: worker.currentExecutionId ? this.database.executionMembers(worker.currentExecutionId)[0]?.jobId ?? "" : "",
+      currentExecutionId: worker.currentExecutionId,
+      activeBatchSize: worker.currentExecutionId ? this.database.getExecution(worker.currentExecutionId)?.batchSize ?? 0 : 0,
+      batchCapable: worker.batchCapable,
+      maxBatchSize: worker.batchCapable ? this.maximumConfiguredBatch(worker) : 1,
+      batchStrategies: [...worker.batchAdapters].sort(),
       appliedRevision: worker.appliedRevision, secondsPerImage: worker.config.secondsPerImage,
       effectiveSecondsPerImage: this.effectiveSeconds(worker), ewmaSamples: worker.ewmaSamples,
       lastError: worker.lastError, deviceName: worker.deviceName,
@@ -210,19 +229,41 @@ export class GatewayService extends EventEmitter {
     return worker.ewmaSamples >= this.config.scheduler.ewmaMinSamples && worker.ewmaMs > 0 ? worker.ewmaMs / 1000 : worker.config.secondsPerImage;
   }
 
+  private configuredBatchSize(worker: WorkerRuntime, profile: string, adapter: BatchAdapter): number {
+    if (!this.config.batching.enabled || !worker.batchAdapters.has(adapter.id)) return 1;
+    const configured = this.config.batching.workers[worker.config.id]?.[profile] ?? 1;
+    return Math.min(configured, adapter.maxBatchSize);
+  }
+
+  private maximumConfiguredBatch(worker: WorkerRuntime): number {
+    return Math.max(1, ...Object.values(this.config.batching.workers[worker.config.id] ?? {}));
+  }
+
+  private scheduleBatchWake(atMs: number): void {
+    if (this.stopped || (this.batchWakeTimer && this.batchWakeAt <= atMs)) return;
+    if (this.batchWakeTimer) clearTimeout(this.batchWakeTimer);
+    this.batchWakeAt = atMs;
+    this.batchWakeTimer = setTimeout(() => {
+      this.batchWakeTimer = undefined;
+      this.batchWakeAt = 0;
+      void this.tick();
+    }, Math.max(0, atMs - Date.now()));
+    this.batchWakeTimer.unref();
+  }
+
   private async tick(): Promise<void> {
     if (this.ticking || this.stopped) return;
     this.ticking = true;
     try {
       const now = Date.now();
-      await Promise.all([...this.workers.values()].filter((worker) => worker.config.enabled && !worker.ready && !worker.currentJobId && worker.nextProbeAt <= now).map(async (worker) => {
+      await Promise.all([...this.workers.values()].filter((worker) => worker.config.enabled && !worker.ready && !worker.currentExecutionId && worker.nextProbeAt <= now).map(async (worker) => {
         try { await this.probeWorker(worker, true, this.catalogRevision()); await this.refreshInventoryIfPrimary(worker); }
         catch { worker.nextProbeAt = Date.now() + this.config.catalog.retryMs; }
       }));
-      await Promise.all([...this.workers.values()].filter((worker) => worker.currentJobId !== "").map((worker) => this.reconcileWorker(worker)));
+      await Promise.all([...this.workers.values()].filter((worker) => worker.currentExecutionId !== "").map((worker) => this.reconcileWorker(worker)));
       if (!this.dispatchPaused) {
         const idleWorkers = [...this.workers.values()]
-          .filter((worker) => worker.ready && !worker.currentJobId)
+          .filter((worker) => worker.ready && !worker.currentExecutionId)
           .sort((left, right) => this.effectiveSeconds(left) - this.effectiveSeconds(right));
         await Promise.all(idleWorkers.map((worker) => this.dispatchWorker(worker)));
       }
@@ -232,16 +273,40 @@ export class GatewayService extends EventEmitter {
   private async probeWorker(worker: WorkerRuntime, rebuild: boolean, revision: number): Promise<void> {
     worker.state = "syncing";
     try {
-      worker.deviceName = await worker.client.validateDevice(worker.config.expectedDeviceName);
+      const device = await worker.client.probeDevice(worker.config.expectedDeviceName);
+      worker.deviceName = device.deviceName;
+      worker.lastSystemStats = device.systemStats;
+      worker.lastProbeAt = Date.now();
       if (rebuild) await worker.client.fullRebuild();
+      worker.batchAdapters.clear();
+      worker.batchCapable = false;
+      if (this.config.batching.enabled && this.maximumConfiguredBatch(worker) > 1) {
+        const requiredNodes = [...new Set(this.batchRegistry.adapters.flatMap((adapter) => adapter.requiredBackendNodes))];
+        const availableNodes = new Set<string>();
+        const support = await Promise.all(requiredNodes.map(async (nodeName) => {
+          try {
+            return { nodeName, supported: await worker.client.supportsNode(nodeName) };
+          } catch (error) {
+            this.emit("warning", { message: `batch capability probe failed for ${worker.config.id}/${nodeName}: ${message(error)}` });
+            return { nodeName, supported: false };
+          }
+        }));
+        for (const result of support) if (result.supported) availableNodes.add(result.nodeName);
+        for (const adapter of this.batchRegistry.adapters) {
+          if (this.batchRegistry.compatible(adapter, availableNodes)) worker.batchAdapters.add(adapter.id);
+        }
+        worker.batchCapable = worker.batchAdapters.size > 0;
+      }
       worker.appliedRevision = revision;
       worker.ready = true;
-      worker.state = worker.currentJobId ? "busy" : "ready";
+      worker.state = worker.currentExecutionId ? "busy" : "ready";
       worker.lastError = "";
       worker.nextProbeAt = 0;
       this.database.setWorkerCatalog(worker.config.id, revision, "ready");
     } catch (error) {
       worker.ready = false;
+      worker.batchCapable = false;
+      worker.batchAdapters.clear();
       worker.state = "offline";
       worker.lastError = message(error);
       worker.nextProbeAt = Date.now() + this.config.catalog.retryMs;
@@ -259,79 +324,125 @@ export class GatewayService extends EventEmitter {
 
   private async dispatchWorker(worker: WorkerRuntime): Promise<void> {
     const queued = this.database.listJobs(["queued"]);
-    let job: JobRecord | undefined;
-    for (const candidate of queued) {
-      const envelope = JSON.parse(candidate.requestJson) as Record<string, unknown>;
-      const { profile, costFactor } = profileAndCost(envelope);
+    let execution: ExecutionRecord | undefined;
+    let memberJobs: JobRecord[] = [];
+    for (let candidateIndex = 0; candidateIndex < queued.length; candidateIndex += 1) {
+      const candidate = queued[candidateIndex]!;
+      const envelope = JSON.parse(candidate.requestJson) as PromptEnvelope;
+      const { profile, costFactor } = profileAndCost(envelope as Record<string, unknown>);
       if (!worker.config.capabilities.includes(profile)) continue;
-      job = this.database.claimQueued(
-        candidate.id,
-        worker.config.id,
-        Math.round(this.effectiveSeconds(worker) * costFactor * 1000),
+      const analyzed = this.batchRegistry.assess(envelope);
+      const adapter = analyzed.candidate ? this.batchRegistry.get(analyzed.candidate.adapterId) : undefined;
+      const maxBatchSize = adapter ? this.configuredBatchSize(worker, profile, adapter) : 1;
+      let selected: Array<{ job: JobRecord; batch: BatchCandidate }> = [];
+      if (adapter && maxBatchSize > 1 && worker.batchAdapters.has(adapter.id)
+        && !(candidate.batchBlocked && (!candidate.batchBlockedAdapter || candidate.batchBlockedAdapter === adapter.id))) {
+        const firstBatch = analyzed.candidate!;
+        for (const possible of queued.slice(candidateIndex)) {
+          if (possible.batchBlocked && (!possible.batchBlockedAdapter || possible.batchBlockedAdapter === adapter.id)) continue;
+          const possibleEnvelope = JSON.parse(possible.requestJson) as PromptEnvelope;
+          const possibleAssessment = this.batchRegistry.assess(possibleEnvelope);
+          const possibleBatch = possibleAssessment.candidate;
+          if (possibleBatch?.adapterId === firstBatch.adapterId && possibleBatch.mergeKey === firstBatch.mergeKey) {
+            selected.push({ job: possible, batch: possibleBatch });
+          }
+          if (selected.length >= maxBatchSize) break;
+        }
+        if (selected.length === 1 && Date.now() < candidate.createdAtMs + this.config.batching.mergeWindowMs) {
+          this.scheduleBatchWake(candidate.createdAtMs + this.config.batching.mergeWindowMs);
+          continue;
+        }
+      }
+
+      let executionId = candidate.id;
+      let executionEnvelope = envelope;
+      let strategyId = "";
+      let strategyVersion = 0;
+      let batchPlanJson = "";
+      memberJobs = [candidate];
+      if (selected.length >= 2) {
+        const batchExecutionId = randomUUID();
+        try {
+          const physical = adapter!.merge(selected.map((item) => item.batch), batchExecutionId);
+          executionEnvelope = physical.envelope;
+          executionId = batchExecutionId;
+          strategyId = physical.plan.adapter_id;
+          strategyVersion = physical.plan.adapter_version;
+          batchPlanJson = JSON.stringify(physical.plan);
+          memberJobs = selected.map((item) => item.job);
+        } catch (error) {
+          this.emit("warning", { message: `batch graph transform rejected queued group: ${message(error)}` });
+        }
+      }
+      execution = this.database.claimQueuedGroup(
+        memberJobs.map((job) => job.id), executionId, worker.config.id,
+        JSON.stringify(executionEnvelope),
+        Math.round(this.effectiveSeconds(worker) * costFactor * 1000 * memberJobs.length),
+        strategyId, strategyVersion, batchPlanJson,
       );
-      if (job) break;
+      if (execution) break;
     }
-    if (!job) return;
-    worker.currentJobId = job.id;
+    if (!execution) return;
+    worker.currentExecutionId = execution.id;
     worker.state = "busy";
-    this.emit("job", { type: "execution_start", jobId: job.id, workerId: worker.config.id });
+    for (const job of memberJobs) this.emit("job", { type: "execution_start", jobId: job.id, executionId: execution.id, workerId: worker.config.id });
     try {
-      const envelope = JSON.parse(job.requestJson) as PromptEnvelope;
-      const response = await worker.client.submit(envelope, job.id);
-      const backendId = typeof response.prompt_id === "string" ? response.prompt_id : job.id;
-      if (backendId !== job.id) throw new Error(`worker did not preserve gateway prompt_id: ${backendId}`);
-      this.database.markSubmitted(job.id, backendId, JSON.stringify(response));
+      const executionEnvelope = JSON.parse(execution.requestJson) as PromptEnvelope;
+      const response = await worker.client.submit(executionEnvelope, execution.id);
+      const backendId = typeof response.prompt_id === "string" ? response.prompt_id : execution.id;
+      if (backendId !== execution.id) throw new Error(`worker did not preserve gateway execution prompt_id: ${backendId}`);
+      this.database.markExecutionSubmitted(execution.id, backendId, JSON.stringify(response));
     } catch (error) {
       if (error instanceof UpstreamHttpError) {
         const detail = new TextDecoder().decode(error.body).slice(0, 2000);
-        this.database.markTerminal(job.id, "failed", JSON.stringify(errorHistory(job.id, `worker rejected prompt: ${detail}`)), "worker_rejected", `worker returned HTTP ${error.status}`);
+        if (execution.batchSize > 1) {
+          this.database.requeueBatchExecution(execution.id, `worker returned HTTP ${error.status}: ${detail}`);
+          for (const job of memberJobs) this.emit("job", { type: "batch_fallback", jobId: job.id, executionId: execution.id, workerId: worker.config.id });
+        } else {
+          this.failExecutionMembers(execution, `worker rejected prompt: ${detail}`, "worker_rejected");
+        }
         this.releaseWorker(worker);
+        void this.tick();
       } else {
-        await this.reconcileAmbiguousSubmission(worker, job.id, error);
+        await this.reconcileAmbiguousSubmission(worker, execution.id, error);
       }
     }
   }
 
-  private async reconcileAmbiguousSubmission(worker: WorkerRuntime, jobId: string, cause: unknown): Promise<void> {
+  private async reconcileAmbiguousSubmission(worker: WorkerRuntime, executionId: string, cause: unknown): Promise<void> {
     try {
-      const history = await worker.client.history(jobId);
+      const history = await worker.client.history(executionId);
       if (history.found) {
-        this.database.markSubmitted(jobId, jobId, "{}");
-        if (history.terminal) await this.finishJob(worker, jobId, history.history, history.succeeded);
+        this.database.markExecutionSubmitted(executionId, executionId, "{}");
+        if (history.terminal) await this.finishExecution(worker, executionId, history.history, history.succeeded);
         return;
       }
-      if (await worker.client.queueContains(jobId)) {
-        this.database.markSubmitted(jobId, jobId, "{}");
+      if (await worker.client.queueContains(executionId)) {
+        this.database.markExecutionSubmitted(executionId, executionId, "{}");
         return;
       }
     } catch { /* preserve the original uncertainty */ }
-    this.database.markUncertain(jobId, `submission outcome is unknown: ${message(cause)}`);
-    worker.lastError = `job ${jobId} submission uncertain`;
+    this.database.markExecutionUncertain(executionId, `submission outcome is unknown: ${message(cause)}`);
+    worker.lastError = `execution ${executionId} submission uncertain`;
   }
 
   private async reconcileWorker(worker: WorkerRuntime): Promise<void> {
-    const job = this.database.getJob(worker.currentJobId);
-    if (!job || ["succeeded", "failed", "cancelled"].includes(job.status)) { this.releaseWorker(worker); return; }
+    const execution = this.database.getExecution(worker.currentExecutionId);
+    if (!execution || ["succeeded", "failed", "cancelled"].includes(execution.status)) { this.releaseWorker(worker); return; }
     try {
-      const backendId = job.backendPromptId || job.id;
+      const backendId = execution.backendPromptId || execution.id;
       const state = await worker.client.history(backendId);
-      if (state.terminal) { await this.finishJob(worker, job.id, state.history, state.succeeded); return; }
+      if (state.terminal) { await this.finishExecution(worker, execution.id, state.history, state.succeeded); return; }
       if (state.found || await worker.client.queueContains(backendId)) {
-        if (job.status !== "uncertain") this.database.markRunning(job.id);
+        if (execution.status !== "uncertain") this.database.markExecutionRunning(execution.id);
         return;
       }
-      if (job.status === "dispatching") {
-        this.database.markUncertain(job.id, "submission outcome is unknown after gateway restart");
+      if (execution.status === "dispatching") {
+        this.database.markExecutionUncertain(execution.id, "submission outcome is unknown after gateway restart");
         return;
       }
-      if (job.submittedAtMs && Date.now() - job.submittedAtMs > this.config.timeouts.maxJobRuntimeMs) {
-        this.database.markTerminal(
-          job.id,
-          "failed",
-          JSON.stringify(errorHistory(job.id, "job exceeded maximum runtime and no longer exists in backend history or queue")),
-          "backend_state_lost",
-          "job exceeded maximum runtime and no longer exists in backend history or queue",
-        );
+      if (execution.submittedAtMs && Date.now() - execution.submittedAtMs > this.config.timeouts.maxJobRuntimeMs) {
+        this.failExecutionMembers(execution, "execution exceeded maximum runtime and no longer exists in backend history or queue", "backend_state_lost");
         this.releaseWorker(worker);
       }
     } catch (error) {
@@ -342,46 +453,97 @@ export class GatewayService extends EventEmitter {
     }
   }
 
-  private async finishJob(worker: WorkerRuntime, jobId: string, history: JsonObject, succeeded: boolean): Promise<void> {
-    const before = this.database.getJob(jobId);
-    if (!succeeded) {
-      const cancelled = before?.errorCode === "interrupt_requested";
-      this.database.markTerminal(jobId, cancelled ? "cancelled" : "failed", JSON.stringify(history), cancelled ? "cancelled" : "worker_execution_failed", cancelled ? "job interrupted" : "worker execution failed");
-      this.emit("job", { type: cancelled ? "execution_interrupted" : "execution_error", jobId, workerId: worker.config.id });
+  private async finishExecution(worker: WorkerRuntime, executionId: string, history: JsonObject, succeeded: boolean): Promise<void> {
+    const before = this.database.getExecution(executionId);
+    if (!before) { this.releaseWorker(worker); return; }
+    const activeMembers = this.database.nonTerminalExecutionMembers(executionId);
+    if (activeMembers.length === 0) {
+      this.database.markExecutionTerminal(executionId, "cancelled", "cancelled", "all execution members were cancelled");
       this.releaseWorker(worker);
       return;
     }
-    this.database.markCollecting(jobId);
+    if (!succeeded) {
+      if (before.batchSize > 1 && before.errorCode !== "interrupt_requested") {
+        this.database.requeueBatchExecution(executionId, "worker batch execution failed; retrying members individually");
+        for (const member of activeMembers) this.emit("job", { type: "batch_fallback", jobId: member.jobId, executionId, workerId: worker.config.id });
+      } else {
+        const cancelled = before.errorCode === "interrupt_requested";
+        this.failExecutionMembers(before, cancelled ? "job interrupted" : "worker execution failed", cancelled ? "cancelled" : "worker_execution_failed", history, cancelled);
+      }
+      this.releaseWorker(worker);
+      void this.tick();
+      return;
+    }
+    this.database.markExecutionCollecting(executionId);
     try {
-      const collected = await this.outputStore.collect(jobId, worker.client, history);
-      this.database.saveOutputs(jobId, JSON.stringify(collected.history), collected.outputs);
-      const submittedAt = before?.submittedAtMs;
+      const batchBinding = this.batchBinding(before);
+      const collected = await this.outputStore.collectExecution(
+        executionId, activeMembers, worker.client, history, batchBinding?.adapter, batchBinding?.plan,
+      );
+      this.database.saveExecutionOutputs(executionId, collected.map((member) => ({
+        jobId: member.jobId, historyJson: JSON.stringify(member.history), outputs: member.outputs,
+      })));
+      const submittedAt = before.submittedAtMs;
       if (submittedAt) {
-        const stats = this.database.observeWorker(worker.config.id, Math.max(1, Date.now() - submittedAt), this.config.scheduler.ewmaAlpha);
+        const elapsedPerImage = Math.max(1, Math.round((Date.now() - submittedAt) / before.batchSize));
+        const stats = this.database.observeWorker(worker.config.id, elapsedPerImage, this.config.scheduler.ewmaAlpha);
         worker.ewmaMs = stats.ewmaMs;
         worker.ewmaSamples = stats.samples;
       }
-      this.emit("job", { type: "executed", jobId, workerId: worker.config.id });
+      for (const member of activeMembers) this.emit("job", { type: "executed", jobId: member.jobId, executionId, workerId: worker.config.id });
+      this.releaseWorker(worker);
     } catch (error) {
-      this.database.markUncertain(jobId, `backend succeeded but output collection failed: ${message(error)}`);
+      this.database.markExecutionUncertain(executionId, `backend succeeded but output collection failed: ${message(error)}`, "output_collection_failed");
+      worker.lastError = `execution ${executionId} output collection will be retried: ${message(error)}`;
     }
-    this.releaseWorker(worker);
+  }
+
+  private failExecutionMembers(
+    execution: ExecutionRecord, detail: string, errorCode: string,
+    backendHistory?: JsonObject, cancelled = false,
+  ): void {
+    for (const member of this.database.nonTerminalExecutionMembers(execution.id)) {
+      let history: JsonObject = errorHistory(member.jobId, detail) as JsonObject;
+      if (backendHistory) {
+        try { history = historyForMember(backendHistory, execution.backendPromptId || execution.id, member.jobId); }
+        catch { /* retain a gateway-generated terminal history */ }
+      }
+      this.database.markTerminal(member.jobId, cancelled ? "cancelled" : "failed", JSON.stringify(history), errorCode, detail);
+      this.emit("job", { type: cancelled ? "execution_interrupted" : "execution_error", jobId: member.jobId, executionId: execution.id, workerId: execution.workerId });
+    }
+    this.database.markExecutionTerminal(execution.id, cancelled ? "cancelled" : "failed", errorCode, detail);
+  }
+
+  private batchBinding(execution: ExecutionRecord): { adapter: BatchAdapter; plan: BatchPlan } | undefined {
+    if (!execution.strategyId || !execution.batchPlanJson) return undefined;
+    const adapter = this.batchRegistry.get(execution.strategyId);
+    if (!adapter) throw new Error(`batch adapter ${execution.strategyId} is unavailable`);
+    if (adapter.version !== execution.strategyVersion) {
+      throw new Error(`batch adapter ${execution.strategyId} version ${execution.strategyVersion} is unavailable`);
+    }
+    let plan: BatchPlan;
+    try { plan = JSON.parse(execution.batchPlanJson) as BatchPlan; }
+    catch { throw new Error(`batch execution ${execution.id} has invalid persisted plan`); }
+    if (plan.adapter_id !== adapter.id || plan.adapter_version !== adapter.version) {
+      throw new Error(`batch execution ${execution.id} plan does not match adapter ${adapter.id}`);
+    }
+    return { adapter, plan };
   }
 
   private releaseWorker(worker: WorkerRuntime): void {
-    worker.currentJobId = "";
+    worker.currentExecutionId = "";
     worker.state = worker.ready ? "ready" : "offline";
   }
 
   private async recoverJobs(): Promise<void> {
-    for (const job of this.database.listJobs(["dispatching", "submitted", "running", "collecting", "uncertain"])) {
-      const worker = this.workers.get(job.workerId);
-      if (!worker) { this.database.markUncertain(job.id, `assigned worker ${job.workerId} is not configured`); continue; }
-      if (worker.currentJobId && worker.currentJobId !== job.id) {
-        this.database.markUncertain(job.id, `multiple recovered jobs claim worker ${job.workerId}`);
+    for (const execution of this.database.listExecutions(["dispatching", "submitted", "running", "collecting", "uncertain"])) {
+      const worker = this.workers.get(execution.workerId);
+      if (!worker) { this.database.markExecutionUncertain(execution.id, `assigned worker ${execution.workerId} is not configured`); continue; }
+      if (worker.currentExecutionId && worker.currentExecutionId !== execution.id) {
+        this.database.markExecutionUncertain(execution.id, `multiple recovered executions claim worker ${execution.workerId}`);
         continue;
       }
-      worker.currentJobId = job.id;
+      worker.currentExecutionId = execution.id;
       if (worker.ready) worker.state = "busy";
     }
   }
@@ -393,11 +555,22 @@ export class GatewayService extends EventEmitter {
       const cancelled = this.database.cancelQueued(id);
       return { cancelled, state: cancelled ? "cancelled" : this.database.getJob(id)?.status ?? job.status };
     }
-    if (["submitted", "running", "uncertain"].includes(job.status)) {
+    if (["dispatching", "submitted", "running", "uncertain"].includes(job.status)) {
+      const execution = this.database.activeExecutionForJob(id);
+      if (!execution) throw new GatewayRequestError(409, "job_not_interruptible", "job has no active physical execution");
       const worker = this.workers.get(job.workerId);
-      if (!worker || worker.currentJobId !== id) throw new GatewayRequestError(409, "job_not_interruptible", "job has no active worker lease");
-      await worker.client.interrupt(job.backendPromptId || id);
-      this.database.markInterruptRequested(id);
+      if (!worker || worker.currentExecutionId !== execution.id) throw new GatewayRequestError(409, "job_not_interruptible", "job has no active worker lease");
+      if (execution.batchSize > 1) {
+        const cancelled = this.database.cancelExecutionMember(id);
+        if (cancelled && this.database.nonTerminalExecutionMembers(execution.id).length === 0) {
+          try { await worker.client.interrupt(execution.backendPromptId || execution.id); }
+          catch (error) { worker.lastError = `final batch-member interrupt failed: ${message(error)}`; }
+          this.database.markExecutionUncertain(execution.id, "all batch members cancelled; awaiting backend terminal state", "interrupt_requested");
+        }
+        return { cancelled, state: cancelled ? "cancelled" : this.database.getJob(id)?.status ?? job.status };
+      }
+      await worker.client.interrupt(execution.backendPromptId || execution.id);
+      this.database.markExecutionUncertain(execution.id, "interrupt requested; awaiting backend terminal state", "interrupt_requested");
       return { cancelled: false, state: "interrupt_requested" };
     }
     throw new GatewayRequestError(409, "job_not_cancellable", `job is ${job.status}`);
@@ -409,6 +582,49 @@ export class GatewayService extends EventEmitter {
   }
 
   async systemStats(): Promise<JsonObject> { return this.primary.client.systemStats(); }
+
+  clusterStatus(): Record<string, unknown> {
+    const queue = this.queue();
+    const groupCounts = new Map<string, number>();
+    const rejectionCounts = new Map<string, number>();
+    for (const job of queue.pending) {
+      const assessment = this.batchRegistry.assess(JSON.parse(job.requestJson) as PromptEnvelope);
+      const candidate = assessment.candidate;
+      if (!candidate) {
+        for (const rejection of assessment.rejections) {
+          if (rejection.kind !== "reject") continue;
+          rejectionCounts.set(rejection.reason, (rejectionCounts.get(rejection.reason) ?? 0) + 1);
+        }
+        continue;
+      }
+      if (job.batchBlocked && (!job.batchBlockedAdapter || job.batchBlockedAdapter === candidate.adapterId)) continue;
+      const groupKey = `${candidate.adapterId}:${candidate.mergeKey}`;
+      groupCounts.set(groupKey, (groupCounts.get(groupKey) ?? 0) + 1);
+    }
+    const activeExecutions = this.database.listExecutions(["dispatching", "submitted", "running", "collecting", "uncertain"]);
+    return {
+      generated_at_ms: Date.now(),
+      catalog_revision: this.catalogRevision(),
+      queue: { pending: queue.pending.length, running_members: queue.running.length, active_executions: activeExecutions.length },
+      batching: {
+        enabled: this.config.batching.enabled,
+        merge_window_ms: this.config.batching.mergeWindowMs,
+        queued_candidates: [...groupCounts.values()].reduce((total, count) => total + count, 0),
+        mergeable_groups: [...groupCounts.values()].filter((count) => count >= 2).length,
+        rejections: Object.fromEntries(rejectionCounts),
+        active_executions: activeExecutions.map((execution) => ({
+          id: execution.id, worker_id: execution.workerId, status: execution.status,
+          batch_size: execution.batchSize,
+          member_job_ids: this.database.executionMembers(execution.id).map((member) => member.jobId),
+          submitted_at_ms: execution.submittedAtMs,
+        })),
+      },
+      workers: this.workerSnapshots().map((snapshot) => {
+        const runtime = this.workers.get(snapshot.id)!;
+        return { ...snapshot, last_probe_at_ms: runtime.lastProbeAt, system_stats: runtime.lastSystemStats };
+      }),
+    };
+  }
 
   async refreshInventory(): Promise<void> {
     const next = new Set<string>();

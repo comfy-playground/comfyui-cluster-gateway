@@ -13,6 +13,13 @@ export interface WorkerConfig {
   enabled: boolean;
 }
 
+export interface BatchingConfig {
+  enabled: boolean;
+  mergeWindowMs: number;
+  workers: Record<string, Record<string, number>>;
+  adapters?: Record<string, boolean>;
+}
+
 export interface GatewayConfig {
   version: 1;
   listen: { host: string; port: number };
@@ -37,6 +44,7 @@ export interface GatewayConfig {
     agingSeconds: number;
     tieEpsilonMs: number;
   };
+  batching: BatchingConfig;
   catalog: { refreshOnStart: boolean; retryMs: number; pageSize: number };
   retention: {
     maxAgeHours: number;
@@ -68,6 +76,38 @@ export interface JobRecord {
   updatedAtMs: number;
   submittedAtMs: number | null;
   completedAtMs: number | null;
+  batchBlocked: boolean;
+  batchBlockedAdapter: string;
+}
+
+export type ExecutionStatus =
+  | "dispatching" | "submitted" | "running" | "collecting"
+  | "succeeded" | "failed" | "cancelled" | "uncertain";
+
+export interface ExecutionRecord {
+  id: string;
+  workerId: string;
+  requestJson: string;
+  status: ExecutionStatus;
+  backendPromptId: string;
+  backendResponseJson: string;
+  predictedDurationMs: number;
+  batchSize: number;
+  errorCode: string;
+  errorMessage: string;
+  strategyId: string;
+  strategyVersion: number;
+  batchPlanJson: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+  submittedAtMs: number | null;
+  completedAtMs: number | null;
+}
+
+export interface ExecutionMember {
+  executionId: string;
+  jobId: string;
+  memberIndex: number;
 }
 
 export interface OutputRecord {
@@ -92,6 +132,11 @@ export interface WorkerSnapshot {
   required: boolean;
   primary: boolean;
   currentJobId: string;
+  currentExecutionId: string;
+  activeBatchSize: number;
+  batchCapable: boolean;
+  maxBatchSize: number;
+  batchStrategies: string[];
   appliedRevision: number;
   secondsPerImage: number;
   effectiveSecondsPerImage: number;

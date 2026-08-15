@@ -8,7 +8,15 @@ import { GatewayService } from "../src/gateway.js";
 import { buildServer } from "../src/server.js";
 import type { GatewayConfig, JsonObject } from "../src/types.js";
 
-interface FakeOptions { id: string; deviceName: string; delayMs: number; online?: boolean }
+interface FakeOptions {
+  id: string;
+  deviceName: string;
+  delayMs: number;
+  online?: boolean;
+  batchNode?: boolean;
+  stochasticBatchNode?: boolean;
+  failBatches?: boolean;
+}
 
 class FakeComfyUi {
   readonly server: Server;
@@ -18,6 +26,7 @@ class FakeComfyUi {
   readonly running = new Set<string>();
   readonly histories = new Map<string, JsonObject>();
   readonly submitCounts = new Map<string, number>();
+  readonly submissions = new Map<string, JsonObject>();
   readonly managerCalls: string[] = [];
   activeLoras = new Set(["characters/test.safetensors"]);
 
@@ -56,17 +65,42 @@ class FakeComfyUi {
     if (request.method === "GET" && url.pathname === "/system_stats") {
       this.json(response, 200, { system: { os: "fake" }, devices: [{ name: this.options.deviceName, type: "cuda", index: 0 }] }); return;
     }
+    if (request.method === "GET" && url.pathname === "/object_info/GatewayMultiSeedNoise") {
+      this.json(response, 200, this.options.batchNode ? { GatewayMultiSeedNoise: { input: { required: { seeds: ["STRING", {}] } } } } : {}); return;
+    }
+    if (request.method === "GET" && url.pathname === "/object_info/GatewayMultiSeedStochasticSampler") {
+      this.json(response, 200, this.options.stochasticBatchNode ? { GatewayMultiSeedStochasticSampler: { input: { required: { seeds: ["STRING", {}] } } } } : {}); return;
+    }
     if (request.method === "POST" && url.pathname === "/prompt") {
-      const body = JSON.parse((await this.read(request)).toString("utf8")) as { prompt_id: string };
+      const body = JSON.parse((await this.read(request)).toString("utf8")) as JsonObject & { prompt_id: string };
       const id = body.prompt_id;
       this.submitCounts.set(id, (this.submitCounts.get(id) ?? 0) + 1);
+      this.submissions.set(id, body);
+      let batchSeeds: string[] = [];
+      const prompt = body.prompt;
+      if (prompt && typeof prompt === "object" && !Array.isArray(prompt)) {
+        for (const value of Object.values(prompt)) {
+          if (!value || typeof value !== "object" || Array.isArray(value) || value.class_type !== "GatewayMultiSeedNoise") continue;
+          const inputs = value.inputs;
+          if (!inputs || typeof inputs !== "object" || Array.isArray(inputs) || typeof inputs.seeds !== "string") continue;
+          batchSeeds = JSON.parse(inputs.seeds) as string[];
+        }
+        for (const value of Object.values(prompt)) {
+          if (!value || typeof value !== "object" || Array.isArray(value) || value.class_type !== "GatewayMultiSeedStochasticSampler") continue;
+          const inputs = value.inputs;
+          if (!inputs || typeof inputs !== "object" || Array.isArray(inputs) || typeof inputs.seeds !== "string") continue;
+          batchSeeds = JSON.parse(inputs.seeds) as string[];
+        }
+      }
       this.running.add(id);
       setTimeout(() => {
         if (!this.running.delete(id)) return;
+        const failed = this.options.failBatches === true && batchSeeds.length > 1;
+        const images = (batchSeeds.length > 0 ? batchSeeds : [id]).map((seed, index) => ({ filename: `${id}-${index}-${seed}.png`, subfolder: "", type: "output" }));
         this.histories.set(id, {
           [id]: {
-            outputs: { "9": { images: [{ filename: `${id}.png`, subfolder: "", type: "output" }] } },
-            status: { status_str: "success", completed: true },
+            outputs: failed ? {} : { [batchSeeds.length > 0 ? "15" : "9"]: { images } },
+            status: { status_str: failed ? "error" : "success", completed: true },
           },
         });
       }, this.delayMs).unref();
@@ -134,6 +168,7 @@ function config(root: string, primary: FakeComfyUi, fast: FakeComfyUi, overrides
     timeouts: { workerRequestMs: 500, historyPollMs: 20, maxJobRuntimeMs: 5000, catalogDrainMs: 2000 },
     limits: { maxPromptBytes: 1024 * 1024, maxOutputBytes: 1024 * 1024, maxOutputsPerJob: 8, maxQueuedJobs: 100 },
     scheduler: { ewmaAlpha: overrides.ewmaAlpha ?? 0.5, ewmaMinSamples: overrides.ewmaMinSamples ?? 10, agingSeconds: overrides.agingSeconds ?? 30, tieEpsilonMs: overrides.tieEpsilonMs ?? 5 },
+    batching: { enabled: false, mergeWindowMs: 20, workers: {} },
     catalog: { refreshOnStart: true, retryMs: 50, pageSize: 100 },
     retention: { maxAgeHours: 24, maxTotalBytes: 1024 * 1024 * 1024, minAgeHours: 1, sweepIntervalMs: 60000 },
     auth: { generationToken: "generation-test", managementToken: "management-test" },
@@ -169,6 +204,32 @@ async function submit(running: RunningGateway, prompt: Record<string, unknown> =
   return ((await response.json()) as { prompt_id: string }).prompt_id;
 }
 
+function batchPrompt(seed: number, text = "same prompt"): Record<string, unknown> {
+  return {
+    "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "model.safetensors" } },
+    "5": { class_type: "CLIPTextEncode", inputs: { text, clip: ["1", 1] } },
+    "6": { class_type: "CLIPTextEncode", inputs: { text: "negative", clip: ["1", 1] } },
+    "7": { class_type: "EmptyLatentImage", inputs: { width: 1024, height: 1536, batch_size: 1 } },
+    "13": { class_type: "KSampler", inputs: { seed, steps: 28, cfg: 5, sampler_name: "euler", scheduler: "normal", denoise: 1, model: ["1", 0], positive: ["5", 0], negative: ["6", 0], latent_image: ["7", 0] } },
+    "14": { class_type: "VAEDecode", inputs: { samples: ["13", 0], vae: ["1", 2] } },
+    "15": { class_type: "SaveImage", inputs: { filename_prefix: "plugin-prefix", images: ["14", 0] } },
+  };
+}
+
+function animaBatchPrompt(seed: number, samplerName = "euler"): Record<string, unknown> {
+  return {
+    "1": { class_type: "UNETLoader", inputs: { unet_name: "anima-base-v1.0.safetensors", weight_dtype: "default" } },
+    "2": { class_type: "CLIPLoader", inputs: { clip_name: "qwen_3_06b_base.safetensors", type: "stable_diffusion", device: "default" } },
+    "3": { class_type: "VAELoader", inputs: { vae_name: "qwen_image_vae.safetensors" } },
+    "5": { class_type: "CLIPTextEncode", inputs: { text: "same", clip: ["2", 0] } },
+    "6": { class_type: "CLIPTextEncode", inputs: { text: "bad", clip: ["2", 0] } },
+    "7": { class_type: "EmptyLatentImage", inputs: { width: 1024, height: 1024, batch_size: 1 } },
+    "13": { class_type: "KSampler", inputs: { seed, steps: 35, cfg: 4.5, sampler_name: samplerName, scheduler: "sgm_uniform", denoise: 1, model: ["1", 0], positive: ["5", 0], negative: ["6", 0], latent_image: ["7", 0] } },
+    "14": { class_type: "VAEDecode", inputs: { samples: ["13", 0], vae: ["3", 0] } },
+    "15": { class_type: "SaveImage", inputs: { filename_prefix: "anima", images: ["14", 0] } },
+  };
+}
+
 async function waitFor<T>(probe: () => Promise<T | undefined>, timeoutMs = 5000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -197,7 +258,182 @@ async function fixture(primaryOnline = true, fastOnline = true): Promise<{ root:
   return { root, primary, fast, running };
 }
 
+async function batchFixture(options: { batchNode?: boolean; stochasticBatchNode?: boolean; failBatches?: boolean; delayMs?: number } = {}): Promise<{ root: string; primary: FakeComfyUi; fast: FakeComfyUi; running: RunningGateway; gatewayConfig: GatewayConfig }> {
+  const root = await mkdtemp(join(tmpdir(), "gateway-ts-batch-"));
+  const primary = new FakeComfyUi({
+    id: "a3000", deviceName: "cuda:0 NVIDIA RTX A3000 Laptop GPU : cudaMallocAsync",
+    delayMs: options.delayMs ?? 80, batchNode: options.batchNode ?? true, stochasticBatchNode: options.stochasticBatchNode ?? true, failBatches: options.failBatches ?? false,
+  });
+  const fast = new FakeComfyUi({ id: "3090", deviceName: "cuda:0 NVIDIA GeForce RTX 3090 : cudaMallocAsync", delayMs: 40 });
+  await primary.start(); await fast.start();
+  const gatewayConfig = config(root, primary, fast);
+  gatewayConfig.workers[1]!.enabled = false;
+  gatewayConfig.batching = {
+    enabled: true,
+    mergeWindowMs: 20,
+    workers: { "a3000-control": { default: 2, "fast-sdxl": 2 } },
+  };
+  const running = await startGateway(gatewayConfig);
+  cleanups.push(async () => { await stopGateway(running); await primary.stop(); await fast.stop(); await rm(root, { recursive: true, force: true }); });
+  return { root, primary, fast, running, gatewayConfig };
+}
+
 describe("ComfyUI gateway black-box flow", () => {
+  it("coalesces Anima UNETLoader euler/sgm_uniform requests", async () => {
+    const { running, primary } = await batchFixture();
+    const ids = await Promise.all([submit(running, animaBatchPrompt(101)), submit(running, animaBatchPrompt(202))]);
+    const histories = await Promise.all(ids.map((id) => terminalHistory(running, id)));
+    expect(primary.submissions.size).toBe(1);
+    const physical = [...primary.submissions.values()][0]!;
+    const prompt = physical.prompt as JsonObject;
+    expect(prompt["7"]).toMatchObject({ inputs: { batch_size: 2 } });
+    expect(prompt["13"]).toMatchObject({ class_type: "SamplerCustomAdvanced" });
+    expect(prompt["19"]).toMatchObject({ class_type: "BasicScheduler", inputs: { scheduler: "sgm_uniform" } });
+    const firstJob = running.database.getJob(ids[0]!);
+    expect(firstJob).toBeDefined();
+    const execution = running.database.getExecution(firstJob!.backendPromptId);
+    expect(execution).toMatchObject({ strategyId: "anima-euler-sgm", strategyVersion: 1, batchSize: 2 });
+    expect(JSON.parse(execution!.batchPlanJson)).toMatchObject({ adapter_id: "anima-euler-sgm", adapter_version: 1 });
+    expect((histories[0]![ids[0]!] as JsonObject).outputs).toBeTruthy();
+    expect((histories[1]![ids[1]!] as JsonObject).outputs).toBeTruthy();
+  });
+
+  it("coalesces Anima er_sde requests while preserving guider links and SaveImage node ID", async () => {
+    const { running, primary } = await batchFixture();
+    const ids = await Promise.all([submit(running, animaBatchPrompt(101, "er_sde")), submit(running, animaBatchPrompt(202, "er_sde"))]);
+    const histories = await Promise.all(ids.map((id) => terminalHistory(running, id)));
+    expect(primary.submissions.size).toBe(1);
+    const physical = [...primary.submissions.values()][0]!;
+    const prompt = physical.prompt as JsonObject;
+    expect(prompt["7"]).toMatchObject({ inputs: { batch_size: 2 } });
+    expect(prompt["13"]).toMatchObject({ class_type: "GatewayMultiSeedStochasticSampler", inputs: { seeds: "[\"101\",\"202\"]" } });
+    expect(prompt["15"]).toMatchObject({ class_type: "SaveImage", inputs: { images: ["14", 0] } });
+    const guider = Object.values(prompt).find((value) => value && typeof value === "object" && !Array.isArray(value) && value.class_type === "CFGGuider") as JsonObject;
+    expect(guider.inputs).toMatchObject({ positive: ["5", 0], negative: ["6", 0] });
+    const firstJob = running.database.getJob(ids[0]!);
+    expect(running.database.getExecution(firstJob!.backendPromptId)).toMatchObject({ strategyId: "anima-er-sde", strategyVersion: 1, batchSize: 2 });
+    expect((histories[0]![ids[0]!] as JsonObject).outputs).toBeTruthy();
+    expect((histories[1]![ids[1]!] as JsonObject).outputs).toBeTruthy();
+  });
+
+  it("keeps Anima er_sde singleton when the stochastic worker node is unavailable", async () => {
+    const { running, primary } = await batchFixture({ stochasticBatchNode: false });
+    const ids = await Promise.all([submit(running, animaBatchPrompt(101, "er_sde")), submit(running, animaBatchPrompt(202, "er_sde"))]);
+    await Promise.all(ids.map((id) => terminalHistory(running, id)));
+    expect(primary.submissions.size).toBe(2);
+    expect([...primary.submissions.values()].every((submission) => {
+      const prompt = submission.prompt as JsonObject;
+      return !Object.values(prompt).some((value) => value && typeof value === "object" && !Array.isArray(value) && value.class_type === "GatewayMultiSeedStochasticSampler");
+    })).toBe(true);
+  });
+
+  it("coalesces compatible plugin requests and preserves independent public histories and views", async () => {
+    const { running, primary } = await batchFixture();
+    const [first, second] = await Promise.all([
+      submit(running, batchPrompt(101)),
+      submit(running, batchPrompt(202)),
+    ]);
+    expect(first).not.toBe(second);
+    const [firstHistory, secondHistory] = await Promise.all([terminalHistory(running, first), terminalHistory(running, second)]);
+    expect(primary.submissions.size).toBe(1);
+
+    const firstJob = await (await gatewayFetch(running, `/gateway/v1/jobs/${first}`)).json() as { backendPromptId: string };
+    const secondJob = await (await gatewayFetch(running, `/gateway/v1/jobs/${second}`)).json() as { backendPromptId: string };
+    expect(firstJob.backendPromptId).toBe(secondJob.backendPromptId);
+    expect(firstJob.backendPromptId).not.toBe(first);
+    const physical = primary.submissions.get(firstJob.backendPromptId)!;
+    const physicalPrompt = physical.prompt as JsonObject;
+    const noise = Object.values(physicalPrompt).find((value) => value && typeof value === "object" && !Array.isArray(value) && value.class_type === "GatewayMultiSeedNoise") as JsonObject;
+    expect(JSON.parse((noise.inputs as JsonObject).seeds as string)).toEqual(["101", "202"]);
+    expect((physicalPrompt["7"] as JsonObject).inputs).toMatchObject({ batch_size: 2 });
+    expect((physicalPrompt["13"] as JsonObject).class_type).toBe("SamplerCustomAdvanced");
+
+    const firstImages = ((firstHistory[first] as JsonObject).outputs as JsonObject)["15"] as JsonObject;
+    const secondImages = ((secondHistory[second] as JsonObject).outputs as JsonObject)["15"] as JsonObject;
+    expect(firstImages.images).toHaveLength(1);
+    expect(secondImages.images).toHaveLength(1);
+    const firstImage = (firstImages.images as JsonObject[])[0]!;
+    const secondImage = (secondImages.images as JsonObject[])[0]!;
+    expect(firstImage.subfolder).toBe(first);
+    expect(secondImage.subfolder).toBe(second);
+    const firstView = await gatewayFetch(running, `/view?${new URLSearchParams(firstImage as Record<string, string>).toString()}`);
+    const secondView = await gatewayFetch(running, `/view?${new URLSearchParams(secondImage as Record<string, string>).toString()}`);
+    expect(await firstView.text()).toContain("-0-101.png");
+    expect(await secondView.text()).toContain("-1-202.png");
+
+    const status = await (await gatewayFetch(running, "/gateway/v1/status")).json() as { workers: Array<{ id: string; batchCapable: boolean; maxBatchSize: number }>; queue: { pending: number; running_members: number } };
+    expect(status.workers.find((worker) => worker.id === "a3000-control")).toMatchObject({ batchCapable: true, maxBatchSize: 2 });
+    expect(status.queue).toMatchObject({ pending: 0, running_members: 0 });
+  });
+
+  it("does not merge requests with different prompts", async () => {
+    const { running, primary } = await batchFixture();
+    const ids = await Promise.all([
+      submit(running, batchPrompt(101, "first prompt")),
+      submit(running, batchPrompt(202, "second prompt")),
+    ]);
+    await Promise.all(ids.map((id) => terminalHistory(running, id)));
+    expect(primary.submissions.size).toBe(2);
+    expect([...primary.submissions.values()].every((submission) => {
+      const prompt = submission.prompt as JsonObject;
+      return !Object.values(prompt).some((value) => value && typeof value === "object" && !Array.isArray(value) && value.class_type === "GatewayMultiSeedNoise");
+    })).toBe(true);
+  });
+
+  it("automatically falls back to singleton execution when the worker lacks the batch node", async () => {
+    const { running, primary } = await batchFixture({ batchNode: false, stochasticBatchNode: false });
+    const ids = await Promise.all([submit(running, batchPrompt(101)), submit(running, batchPrompt(202))]);
+    await Promise.all(ids.map((id) => terminalHistory(running, id)));
+    expect(primary.submissions.size).toBe(2);
+    const status = await (await gatewayFetch(running, "/gateway/v1/status")).json() as { workers: Array<{ id: string; batchCapable: boolean }> };
+    expect(status.workers.find((worker) => worker.id === "a3000-control")?.batchCapable).toBe(false);
+  });
+
+  it("retries physical batch failures as independent singleton jobs", async () => {
+    const { running, primary } = await batchFixture({ failBatches: true });
+    const ids = await Promise.all([submit(running, batchPrompt(101)), submit(running, batchPrompt(202))]);
+    await Promise.all(ids.map((id) => terminalHistory(running, id)));
+    expect(primary.submissions.size).toBe(3);
+    const jobs = await Promise.all(ids.map(async (id) => await (await gatewayFetch(running, `/gateway/v1/jobs/${id}`)).json() as { status: string; batchBlocked: boolean }));
+    expect(jobs).toEqual([
+      expect.objectContaining({ status: "succeeded", batchBlocked: true }),
+      expect.objectContaining({ status: "succeeded", batchBlocked: true }),
+    ]);
+  });
+
+  it("recovers an in-flight physical batch after restart without duplicate GPU submission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "gateway-ts-batch-restart-"));
+    const primary = new FakeComfyUi({ id: "a3000", deviceName: "cuda:0 NVIDIA RTX A3000 Laptop GPU : cudaMallocAsync", delayMs: 500, batchNode: true });
+    const fast = new FakeComfyUi({ id: "3090", deviceName: "cuda:0 NVIDIA GeForce RTX 3090 : cudaMallocAsync", delayMs: 100 });
+    await primary.start(); await fast.start();
+    const gatewayConfig = config(root, primary, fast);
+    gatewayConfig.workers[1]!.enabled = false;
+    gatewayConfig.batching = { enabled: true, mergeWindowMs: 20, workers: { "a3000-control": { default: 2 } } };
+    let running = await startGateway(gatewayConfig);
+    const ids = await Promise.all([submit(running, batchPrompt(101)), submit(running, batchPrompt(202))]);
+    await waitFor(async () => primary.submissions.size === 1 ? true : undefined);
+    const executionId = [...primary.submissions.keys()][0]!;
+    await stopGateway(running);
+    running = await startGateway(gatewayConfig);
+    cleanups.push(async () => { await stopGateway(running); await primary.stop(); await fast.stop(); await rm(root, { recursive: true, force: true }); });
+    await Promise.all(ids.map((id) => terminalHistory(running, id)));
+    expect(primary.submitCounts.get(executionId)).toBe(1);
+  });
+
+  it("logically cancels one batch member without interrupting the other member", async () => {
+    const { running, primary } = await batchFixture({ delayMs: 300 });
+    const [first, second] = await Promise.all([submit(running, batchPrompt(101)), submit(running, batchPrompt(202))]);
+    await waitFor(async () => primary.submissions.size === 1 ? true : undefined);
+    const cancel = await gatewayFetch(running, `/gateway/v1/jobs/${first}/cancel`, { method: "POST" });
+    expect(await cancel.json()).toMatchObject({ cancelled: true, state: "cancelled" });
+    const firstHistory = await terminalHistory(running, first);
+    expect(((firstHistory[first] as JsonObject).status as JsonObject).status_str).toBe("error");
+    await terminalHistory(running, second);
+    expect(primary.submissions.size).toBe(1);
+    const jobs = await Promise.all([first, second].map(async (id) => await (await gatewayFetch(running, `/gateway/v1/jobs/${id}`)).json() as { status: string }));
+    expect(jobs.map((job) => job.status)).toEqual(["cancelled", "succeeded"]);
+  });
+
   it("lets whichever worker finishes first consume the next queued image", async () => {
     const { running } = await fixture();
     const ids = await Promise.all(Array.from({ length: 6 }, () => submit(running)));

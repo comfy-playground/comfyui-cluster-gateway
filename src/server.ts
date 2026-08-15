@@ -123,6 +123,7 @@ export async function buildServer(gateway: GatewayService, config: GatewayConfig
 
   app.get("/system_stats", async () => gateway.systemStats());
   app.get("/gateway/v1/workers", async () => ({ workers: gateway.workerSnapshots(), catalog_revision: gateway.catalogRevision() }));
+  app.get("/gateway/v1/status", async () => gateway.clusterStatus());
   app.get("/gateway/v1/jobs/:id", async (request, reply) => {
     const job = gateway.getJob((request.params as { id: string }).id);
     if (!job) return reply.code(404).send(errorBody("job_not_found", "gateway job was not found"));

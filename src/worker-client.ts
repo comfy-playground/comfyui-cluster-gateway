@@ -62,7 +62,7 @@ export class WorkerClient {
 
   async systemStats(): Promise<JsonObject> { return (await this.json("/system_stats")).value; }
 
-  async validateDevice(expectedName: string): Promise<string> {
+  async probeDevice(expectedName: string): Promise<{ deviceName: string; systemStats: JsonObject }> {
     const stats = await this.systemStats();
     const devices = stats.devices;
     if (!Array.isArray(devices) || devices.length !== 1) throw new Error(`expected exactly one visible device, got ${Array.isArray(devices) ? devices.length : 0}`);
@@ -70,7 +70,17 @@ export class WorkerClient {
     if (device === null || typeof device !== "object" || Array.isArray(device)) throw new Error("system_stats device is invalid");
     const name = (device as JsonObject).name;
     if (name !== expectedName) throw new Error(`expected device ${JSON.stringify(expectedName)}, got ${JSON.stringify(name)}`);
-    return name;
+    return { deviceName: name, systemStats: stats };
+  }
+
+  async validateDevice(expectedName: string): Promise<string> {
+    return (await this.probeDevice(expectedName)).deviceName;
+  }
+
+  async supportsNode(classType: string): Promise<boolean> {
+    const objectInfo = (await this.json(`/object_info/${encodeURIComponent(classType)}`)).value;
+    const definition = objectInfo[classType];
+    return definition !== null && typeof definition === "object" && !Array.isArray(definition);
   }
 
   async submit(envelope: PromptEnvelope, promptId: string): Promise<JsonObject> {

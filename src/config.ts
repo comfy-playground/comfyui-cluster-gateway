@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parse } from "yaml";
-import type { GatewayConfig, JsonObject, JsonValue, WorkerConfig } from "./types.js";
+import type { BatchingConfig, GatewayConfig, JsonObject, JsonValue, WorkerConfig } from "./types.js";
 
 function objectAt(value: unknown, path: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -68,7 +68,7 @@ function workerAt(value: unknown, index: number): WorkerConfig {
 export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const document = parse(source) as unknown;
   const root = objectAt(document, "config");
-  exact(root, ["version", "listen", "database_path", "output_directory", "workers", "timeouts", "limits", "scheduler", "catalog", "retention", "auth"], "config");
+  exact(root, ["version", "listen", "database_path", "output_directory", "workers", "timeouts", "limits", "scheduler", "batching", "catalog", "retention", "auth"], "config");
   if (root.version !== 1) throw new Error("config.version must be 1");
 
   const listen = objectAt(root.listen, "listen");
@@ -79,6 +79,8 @@ export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env
   exact(limits, ["max_prompt_bytes", "max_output_bytes", "max_outputs_per_job", "max_queued_jobs"], "limits");
   const scheduler = objectAt(root.scheduler, "scheduler");
   exact(scheduler, ["ewma_alpha", "ewma_min_samples", "aging_seconds", "tie_epsilon_ms"], "scheduler");
+  const batchingRaw = root.batching === undefined ? undefined : objectAt(root.batching, "batching");
+  if (batchingRaw) exact(batchingRaw, ["enabled", "merge_window_ms", "workers", "adapters"], "batching");
   const catalog = objectAt(root.catalog, "catalog");
   exact(catalog, ["refresh_on_start", "retry_ms", "page_size"], "catalog");
   const retention = objectAt(root.retention, "retention");
@@ -95,6 +97,32 @@ export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env
   const primaries = workers.filter((worker) => worker.enabled && worker.primary);
   if (primaries.length !== 1) throw new Error("exactly one enabled worker must be primary");
   if (!primaries[0]?.required) throw new Error("the primary worker must be required");
+
+  const batching: BatchingConfig = { enabled: false, mergeWindowMs: 20, workers: {}, adapters: {} };
+  if (batchingRaw) {
+    batching.enabled = boolAt(batchingRaw.enabled, "batching.enabled");
+    batching.mergeWindowMs = integerAt(batchingRaw.merge_window_ms, "batching.merge_window_ms", 0);
+    if (batchingRaw.adapters !== undefined) {
+      const adapters = objectAt(batchingRaw.adapters, "batching.adapters");
+      batching.adapters = {};
+      for (const [adapterId, enabled] of Object.entries(adapters)) {
+        batching.adapters[adapterId] = boolAt(enabled, `batching.adapters.${adapterId}`);
+      }
+    }
+    const workerLimits = objectAt(batchingRaw.workers, "batching.workers");
+    for (const [workerId, profileValue] of Object.entries(workerLimits)) {
+      const worker = workers.find((candidate) => candidate.id === workerId);
+      if (!worker) throw new Error(`batching.workers references unknown worker ${workerId}`);
+      const profiles = objectAt(profileValue, `batching.workers.${workerId}`);
+      batching.workers[workerId] = {};
+      for (const [profile, limitValue] of Object.entries(profiles)) {
+        if (!worker.capabilities.includes(profile)) throw new Error(`batching.workers.${workerId} references unsupported profile ${profile}`);
+        const limit = integerAt(limitValue, `batching.workers.${workerId}.${profile}`, 1);
+        if (limit > 16) throw new Error(`batching.workers.${workerId}.${profile} must be <= 16`);
+        batching.workers[workerId]![profile] = limit;
+      }
+    }
+  }
 
   const generationTokenEnv = stringAt(auth.generation_token_env, "auth.generation_token_env", true);
   const managementTokenEnv = stringAt(auth.management_token_env, "auth.management_token_env", true);
@@ -129,6 +157,7 @@ export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env
       maxQueuedJobs: integerAt(limits.max_queued_jobs, "limits.max_queued_jobs", 1),
     },
     scheduler: { ewmaAlpha: alpha, ewmaMinSamples: integerAt(scheduler.ewma_min_samples, "scheduler.ewma_min_samples", 1), agingSeconds: numberAt(scheduler.aging_seconds, "scheduler.aging_seconds", 0), tieEpsilonMs: integerAt(scheduler.tie_epsilon_ms, "scheduler.tie_epsilon_ms", 0) },
+    batching,
     catalog: { refreshOnStart: boolAt(catalog.refresh_on_start, "catalog.refresh_on_start"), retryMs: integerAt(catalog.retry_ms, "catalog.retry_ms", 10), pageSize: integerAt(catalog.page_size, "catalog.page_size", 1) },
     retention: { maxAgeHours, maxTotalBytes: integerAt(retention.max_total_bytes, "retention.max_total_bytes", 1), minAgeHours, sweepIntervalMs: integerAt(retention.sweep_interval_ms, "retention.sweep_interval_ms", 1000) },
     auth: { generationToken: token(generationTokenEnv, "auth.generation_token_env"), managementToken: token(managementTokenEnv, "auth.management_token_env") },

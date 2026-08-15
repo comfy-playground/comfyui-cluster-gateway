@@ -1,0 +1,4 @@
+[submodule "mcp"]
+	path = mcp
+	url = git@github.com:comfy-playground/comfyui-lora-manager-mcp.git
+	branch = main

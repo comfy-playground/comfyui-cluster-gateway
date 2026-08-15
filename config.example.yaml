@@ -7,21 +7,15 @@ database_path: /data/gateway.sqlite
 output_directory: /data/outputs
 
 workers:
-  - id: a3000-control
-    url: http://host.docker.internal:18188
-    expected_device_name: "cuda:0 NVIDIA RTX A3000 Laptop GPU : cudaMallocAsync"
-    seconds_per_image: 26.6
-    capabilities: [default, fast-sdxl]
+  # Replace the URL and exact device name with values from this worker's
+  # GET /system_stats response. Each upstream must expose exactly one GPU.
+  - id: primary
+    url: http://host.docker.internal:8188
+    expected_device_name: "cuda:0 REPLACE_WITH_THE_EXACT_COMFYUI_DEVICE_NAME"
+    seconds_per_image: 30
+    capabilities: [default]
     required: true
     primary: true
-    enabled: true
-  - id: rtx3090-worker
-    url: http://host.docker.internal:18201
-    expected_device_name: "cuda:0 NVIDIA GeForce RTX 3090 : cudaMallocAsync"
-    seconds_per_image: 12.0
-    capabilities: [default, fast-sdxl]
-    required: false
-    primary: false
     enabled: true
 
 timeouts:
@@ -41,6 +35,17 @@ scheduler:
   ewma_min_samples: 10
   aging_seconds: 30
   tie_epsilon_ms: 500
+
+batching:
+  enabled: false
+  merge_window_ms: 20
+  adapters:
+    sdxl-euler-normal: true
+    anima-euler-sgm: true
+    anima-er-sde: true
+  workers:
+    primary:
+      default: 2
 
 catalog:
   refresh_on_start: true

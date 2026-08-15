@@ -1,4 +1,8 @@
+# Local deployment configuration and credentials.
 .env
+config.yaml
+
+# Generated runtime and development files.
 node_modules/
 dist/
 coverage/
@@ -7,3 +11,6 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 *.log
+__pycache__/
+*.py[cod]
+.DS_Store
