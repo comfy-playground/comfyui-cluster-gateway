@@ -94,6 +94,14 @@ export class GatewayDatabase {
         samples INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS worker_model_stats (
+        worker_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        ewma_ms REAL NOT NULL DEFAULT 0,
+        samples INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(worker_id, model_id)
+      );
       CREATE TABLE IF NOT EXISTS catalog_state (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
         current_revision INTEGER NOT NULL,
@@ -467,6 +475,21 @@ export class GatewayDatabase {
     this.db.prepare(`INSERT INTO worker_stats(worker_id,ewma_ms,samples,updated_at_ms) VALUES(?,?,?,?)
       ON CONFLICT(worker_id) DO UPDATE SET ewma_ms=excluded.ewma_ms,samples=excluded.samples,updated_at_ms=excluded.updated_at_ms`)
       .run(workerId, ewmaMs, samples, Date.now());
+    return { ewmaMs, samples };
+  }
+
+  modelStats(workerId: string, modelId: string): { ewmaMs: number; samples: number } {
+    const row = this.db.prepare("SELECT ewma_ms,samples FROM worker_model_stats WHERE worker_id=? AND model_id=?").get(workerId, modelId);
+    return { ewmaMs: num(row?.ewma_ms), samples: num(row?.samples) };
+  }
+
+  observeWorkerModel(workerId: string, modelId: string, elapsedMs: number, alpha: number): { ewmaMs: number; samples: number } {
+    const old = this.modelStats(workerId, modelId);
+    const ewmaMs = old.samples === 0 ? elapsedMs : alpha * elapsedMs + (1 - alpha) * old.ewmaMs;
+    const samples = old.samples + 1;
+    this.db.prepare(`INSERT INTO worker_model_stats(worker_id,model_id,ewma_ms,samples,updated_at_ms) VALUES(?,?,?,?,?)
+      ON CONFLICT(worker_id,model_id) DO UPDATE SET ewma_ms=excluded.ewma_ms,samples=excluded.samples,updated_at_ms=excluded.updated_at_ms`)
+      .run(workerId, modelId, ewmaMs, samples, Date.now());
     return { ewmaMs, samples };
   }
 

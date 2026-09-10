@@ -123,6 +123,14 @@ export async function buildServer(gateway: GatewayService, config: GatewayConfig
 
   app.get("/system_stats", async () => gateway.systemStats());
   app.get("/gateway/v1/workers", async () => ({ workers: gateway.workerSnapshots(), catalog_revision: gateway.catalogRevision() }));
+  app.get("/gateway/v1/models", async () => ({
+    models: (config.models ?? []).map((model) => ({
+      id: model.id, family: model.family, diffusion: model.diffusion,
+      text_encoder: model.textEncoder, vae: model.vae, capabilities: model.capabilities,
+      max_batch_size: model.maxBatchSize ?? 1,
+      workers: config.workers.filter((worker) => worker.enabled && worker.modelIds?.includes(model.id)).map((worker) => worker.id),
+    })),
+  }));
   app.get("/gateway/v1/status", async () => gateway.clusterStatus());
   app.get("/gateway/v1/jobs/:id", async (request, reply) => {
     const job = gateway.getJob((request.params as { id: string }).id);

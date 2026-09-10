@@ -9,6 +9,7 @@ import type { GatewayDatabase } from "./database.js";
 import { errorHistory } from "./database.js";
 import { historyForMember, OutputStore } from "./output-store.js";
 import { profileAndCost } from "./scheduler.js";
+import { requirementFor, workerSupportsModel } from "./model-registry.js";
 import type { ExecutionRecord, GatewayConfig, JsonObject, JobRecord, JobStatus, PromptEnvelope, WorkerConfig, WorkerSnapshot, WorkerState } from "./types.js";
 import { readResponseBytes, UpstreamHttpError, WorkerClient } from "./worker-client.js";
 
@@ -28,6 +29,8 @@ interface WorkerRuntime {
   nextProbeAt: number;
   lastProbeAt: number;
   lastSystemStats: JsonObject;
+  currentModelId: string;
+  memoryControl: boolean;
 }
 
 export interface ManagerResult {
@@ -68,7 +71,7 @@ export class GatewayService extends EventEmitter {
         client: new WorkerClient(workerConfig.url, config.timeouts.workerRequestMs),
         state: workerConfig.enabled ? "offline" : "disabled", ready: false, currentExecutionId: "", batchCapable: false, batchAdapters: new Set(), appliedRevision: 0,
         lastError: "not probed", deviceName: "", ewmaMs: stats.ewmaMs, ewmaSamples: stats.samples, nextProbeAt: 0,
-        lastProbeAt: 0, lastSystemStats: {},
+        lastProbeAt: 0, lastSystemStats: {}, currentModelId: "", memoryControl: false,
       });
     }
     const primary = [...this.workers.values()].find((worker) => worker.config.enabled && worker.config.primary);
@@ -132,6 +135,12 @@ export class GatewayService extends EventEmitter {
       appliedRevision: worker.appliedRevision, secondsPerImage: worker.config.secondsPerImage,
       effectiveSecondsPerImage: this.effectiveSeconds(worker), ewmaSamples: worker.ewmaSamples,
       lastError: worker.lastError, deviceName: worker.deviceName,
+      currentModelId: worker.currentModelId,
+      ...(worker.config.preferredModelId === undefined ? {} : { preferredModelId: worker.config.preferredModelId }),
+      modelStats: (this.config.models ?? []).filter((model) => worker.config.modelIds?.includes(model.id)).map((model) => {
+        const stats = this.database.modelStats(worker.config.id, model.id);
+        return { modelId: model.id, ewmaMs: stats.ewmaMs, samples: stats.samples };
+      }),
     }));
   }
 
@@ -146,7 +155,9 @@ export class GatewayService extends EventEmitter {
   async enqueue(raw: unknown, idempotencyKey = ""): Promise<JobRecord> {
     const envelope = this.validateEnvelope(raw);
     const { profile } = profileAndCost(envelope as Record<string, unknown>);
-    if (![...this.workers.values()].some((worker) => worker.config.enabled && worker.config.capabilities.includes(profile))) {
+    const requirement = requirementFor(envelope, this.config.models ?? []);
+    if ("error" in requirement) throw new GatewayRequestError(400, "unsupported_model", requirement.error);
+    if (![...this.workers.values()].some((worker) => worker.config.enabled && worker.config.capabilities.includes(profile) && workerSupportsModel(worker.config, requirement, this.config.models ?? []))) {
       throw new GatewayRequestError(503, "no_eligible_worker", `no worker supports profile ${profile}`);
     }
     await this.validateLoras(envelope.prompt);
@@ -229,6 +240,12 @@ export class GatewayService extends EventEmitter {
     return worker.ewmaSamples >= this.config.scheduler.ewmaMinSamples && worker.ewmaMs > 0 ? worker.ewmaMs / 1000 : worker.config.secondsPerImage;
   }
 
+  private workerDispatchScore(worker: WorkerRuntime): number {
+    const legacyPriority = worker.config.legacyPriority ?? 0;
+    const warmPreference = worker.currentModelId && worker.currentModelId === worker.config.preferredModelId ? -1000 : 0;
+    return this.effectiveSeconds(worker) - legacyPriority + warmPreference;
+  }
+
   private configuredBatchSize(worker: WorkerRuntime, profile: string, adapter: BatchAdapter): number {
     if (!this.config.batching.enabled || !worker.batchAdapters.has(adapter.id)) return 1;
     const configured = this.config.batching.workers[worker.config.id]?.[profile] ?? 1;
@@ -264,7 +281,7 @@ export class GatewayService extends EventEmitter {
       if (!this.dispatchPaused) {
         const idleWorkers = [...this.workers.values()]
           .filter((worker) => worker.ready && !worker.currentExecutionId)
-          .sort((left, right) => this.effectiveSeconds(left) - this.effectiveSeconds(right));
+          .sort((left, right) => this.workerDispatchScore(left) - this.workerDispatchScore(right));
         await Promise.all(idleWorkers.map((worker) => this.dispatchWorker(worker)));
       }
     } finally { this.ticking = false; }
@@ -276,6 +293,7 @@ export class GatewayService extends EventEmitter {
       const device = await worker.client.probeDevice(worker.config.expectedDeviceName);
       worker.deviceName = device.deviceName;
       worker.lastSystemStats = device.systemStats;
+      worker.memoryControl = await worker.client.supportsMemoryControl();
       worker.lastProbeAt = Date.now();
       if (rebuild) await worker.client.fullRebuild();
       worker.batchAdapters.clear();
@@ -324,13 +342,33 @@ export class GatewayService extends EventEmitter {
 
   private async dispatchWorker(worker: WorkerRuntime): Promise<void> {
     const queued = this.database.listJobs(["queued"]);
+    const eligible = queued.filter((candidate) => {
+      const envelope = JSON.parse(candidate.requestJson) as PromptEnvelope;
+      const { profile } = profileAndCost(envelope as Record<string, unknown>);
+      const requirement = requirementFor(envelope, this.config.models ?? []);
+      return !("error" in requirement) && worker.config.capabilities.includes(profile)
+        && workerSupportsModel(worker.config, requirement, this.config.models ?? []);
+    });
+    // Prefer the currently resident model, then preserve FIFO order. Aging is
+    // enforced by the queue's created timestamp and this preference only
+    // applies among jobs already eligible for this idle worker.
+    const ordered = worker.currentModelId
+      ? [...eligible.filter((job) => {
+          const requirement = requirementFor(JSON.parse(job.requestJson) as PromptEnvelope, this.config.models ?? []);
+          return !("error" in requirement) && requirement.modelId === worker.currentModelId;
+        }), ...eligible.filter((job) => {
+          const requirement = requirementFor(JSON.parse(job.requestJson) as PromptEnvelope, this.config.models ?? []);
+          return "error" in requirement || requirement.modelId !== worker.currentModelId;
+        })]
+      : eligible;
     let execution: ExecutionRecord | undefined;
     let memberJobs: JobRecord[] = [];
-    for (let candidateIndex = 0; candidateIndex < queued.length; candidateIndex += 1) {
-      const candidate = queued[candidateIndex]!;
+    for (let candidateIndex = 0; candidateIndex < ordered.length; candidateIndex += 1) {
+      const candidate = ordered[candidateIndex]!;
       const envelope = JSON.parse(candidate.requestJson) as PromptEnvelope;
       const { profile, costFactor } = profileAndCost(envelope as Record<string, unknown>);
-      if (!worker.config.capabilities.includes(profile)) continue;
+      const requirement = requirementFor(envelope, this.config.models ?? []);
+      if ("error" in requirement || !worker.config.capabilities.includes(profile) || !workerSupportsModel(worker.config, requirement, this.config.models ?? [])) continue;
       const analyzed = this.batchRegistry.assess(envelope);
       const adapter = analyzed.candidate ? this.batchRegistry.get(analyzed.candidate.adapterId) : undefined;
       const maxBatchSize = adapter ? this.configuredBatchSize(worker, profile, adapter) : 1;
@@ -338,7 +376,7 @@ export class GatewayService extends EventEmitter {
       if (adapter && maxBatchSize > 1 && worker.batchAdapters.has(adapter.id)
         && !(candidate.batchBlocked && (!candidate.batchBlockedAdapter || candidate.batchBlockedAdapter === adapter.id))) {
         const firstBatch = analyzed.candidate!;
-        for (const possible of queued.slice(candidateIndex)) {
+        for (const possible of ordered.slice(candidateIndex)) {
           if (possible.batchBlocked && (!possible.batchBlockedAdapter || possible.batchBlockedAdapter === adapter.id)) continue;
           const possibleEnvelope = JSON.parse(possible.requestJson) as PromptEnvelope;
           const possibleAssessment = this.batchRegistry.assess(possibleEnvelope);
@@ -374,6 +412,15 @@ export class GatewayService extends EventEmitter {
           this.emit("warning", { message: `batch graph transform rejected queued group: ${message(error)}` });
         }
       }
+      if (worker.currentModelId && worker.currentModelId !== requirement.modelId && worker.memoryControl) {
+        try {
+          await worker.client.releaseModels("release");
+          worker.currentModelId = "";
+        } catch (error) {
+          worker.lastError = `model switch release failed: ${message(error)}`;
+          return;
+        }
+      }
       execution = this.database.claimQueuedGroup(
         memberJobs.map((job) => job.id), executionId, worker.config.id,
         JSON.stringify(executionEnvelope),
@@ -384,6 +431,8 @@ export class GatewayService extends EventEmitter {
     }
     if (!execution) return;
     worker.currentExecutionId = execution.id;
+    const dispatchedRequirement = requirementFor(JSON.parse(execution.requestJson) as PromptEnvelope, this.config.models ?? []);
+    if (!("error" in dispatchedRequirement)) worker.currentModelId = dispatchedRequirement.modelId;
     worker.state = "busy";
     for (const job of memberJobs) this.emit("job", { type: "execution_start", jobId: job.id, executionId: execution.id, workerId: worker.config.id });
     try {
@@ -486,9 +535,12 @@ export class GatewayService extends EventEmitter {
       const submittedAt = before.submittedAtMs;
       if (submittedAt) {
         const elapsedPerImage = Math.max(1, Math.round((Date.now() - submittedAt) / before.batchSize));
+        const requirement = requirementFor(JSON.parse(before.requestJson) as PromptEnvelope, this.config.models ?? []);
+        const modelId = "error" in requirement ? "legacy" : requirement.modelId;
         const stats = this.database.observeWorker(worker.config.id, elapsedPerImage, this.config.scheduler.ewmaAlpha);
         worker.ewmaMs = stats.ewmaMs;
         worker.ewmaSamples = stats.samples;
+        this.database.observeWorkerModel(worker.config.id, modelId, elapsedPerImage, this.config.scheduler.ewmaAlpha);
       }
       for (const member of activeMembers) this.emit("job", { type: "executed", jobId: member.jobId, executionId, workerId: worker.config.id });
       this.releaseWorker(worker);

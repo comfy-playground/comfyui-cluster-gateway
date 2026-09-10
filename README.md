@@ -14,6 +14,8 @@ ComfyUI 风格的 HTTP API；网关负责全局排队、按预估完成时间调
 - 使用 SQLite 持久化全局队列、worker 执行映射、幂等键、历史和输出索引；worker
   离线后已完成的图片和 history 仍可由网关读取。
 - 每块 GPU 一个执行槽；初始按配置的每图耗时调度，样本足够后使用 EWMA 实测值。
+- 可选的模型注册表按完整 loader 依赖（扩散模型、文本编码器、VAE）识别请求；worker
+  可通过 `model_ids` 白名单差异化分配模型，状态可由 `/gateway/v1/models` 查询。
 - 可选合批：支持 SDXL `euler/normal`、Anima `euler/sgm_uniform`，以及安装
   专用节点后的 Anima `er_sde`。每个逻辑请求保持独立 `prompt_id`、history 和
   输出；不支持时自动单请求执行。
@@ -66,6 +68,9 @@ Gateway :19189 ---- SQLite + copied output files
    `config.yaml` 和 `.env` 被 Git 忽略。初次启动只配置一个主 worker 即可；需要
    横向扩容时，复制 `workers` 项并增加一个 `primary: false`、`required: false`
    的 worker，再为其增加对应的 `batching.workers` 配置。
+
+   配置 `models` 后，模型请求必须匹配注册条目的完整文件组合，并且目标 worker 的
+   `model_ids` 必须包含该模型。没有 `models` 配置时保留旧版兼容行为。
 3. 构建并启动 Gateway：
 
    ```sh

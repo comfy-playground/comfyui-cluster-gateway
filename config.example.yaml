@@ -17,6 +17,23 @@ workers:
     required: true
     primary: true
     enabled: true
+    # Optional warm-model scheduling hint; it never eagerly loads a model.
+    # preferred_model_id: legacy
+    # legacy_priority: 100
+    # Explicit model assignment is required when `models` is configured.
+    # model_ids: [anima-base-v1]
+
+models: []
+# A model is a complete, exact loader dependency set. To configure one,
+# replace [] with the following block and adapt the files:
+# models:
+#   - id: moody-krea-v7-fp8
+#     family: krea2
+#     diffusion: Moody-Krea-Mix-v7_00002__clean_fp8.safetensors
+#     text_encoder: qwen3vl_4b_fp8_scaled.safetensors
+#     vae: qwen_image_vae.safetensors
+#     capabilities: [default]
+#     max_batch_size: 1
 
 timeouts:
   worker_request_ms: 15000

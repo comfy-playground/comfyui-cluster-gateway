@@ -1,6 +1,6 @@
 services:
   gateway:
-    image: comfyui-gateway-ts:0.1.0
+    image: comfyui-gateway-ts:kr2-preference-20260910
     build:
       context: .
       dockerfile: Dockerfile

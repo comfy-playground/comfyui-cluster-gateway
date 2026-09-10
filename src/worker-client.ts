@@ -83,6 +83,31 @@ export class WorkerClient {
     return definition !== null && typeof definition === "object" && !Array.isArray(definition);
   }
 
+  async supportsMemoryControl(): Promise<boolean> {
+    try {
+      const response = await this.request("/gateway-worker/v1/runtime");
+      if (!response.ok) return false;
+      await readResponseBytes(response, 2 * 1024 * 1024);
+      return true;
+    } catch { return false; }
+  }
+
+  async releaseModels(mode: "offload_gpu" | "release" = "release"): Promise<void> {
+    const created = await this.json("/gateway-worker/v1/memory-operations", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode }),
+    });
+    const operationId = created.value.operation_id;
+    if (typeof operationId !== "string" || operationId === "") throw new Error("worker returned no memory operation id");
+    const deadline = Date.now() + 120_000;
+    for (;;) {
+      if (Date.now() >= deadline) throw new Error(`worker memory operation ${operationId} timed out`);
+      const status = (await this.json(`/gateway-worker/v1/memory-operations/${encodeURIComponent(operationId)}`)).value.state;
+      if (status === "succeeded") return;
+      if (status === "failed" || status === "timed_out") throw new Error(`worker memory operation ${operationId} ${String(status)}`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
   async submit(envelope: PromptEnvelope, promptId: string): Promise<JsonObject> {
     const body: PromptEnvelope = { ...envelope, prompt_id: promptId };
     return (await this.json("/prompt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).value;

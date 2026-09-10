@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parse } from "yaml";
-import type { BatchingConfig, GatewayConfig, JsonObject, JsonValue, WorkerConfig } from "./types.js";
+import type { BatchingConfig, GatewayConfig, JsonObject, JsonValue, ModelConfig, WorkerConfig } from "./types.js";
 
 function objectAt(value: unknown, path: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -49,11 +49,11 @@ function stringsAt(value: unknown, path: string): string[] {
 function workerAt(value: unknown, index: number): WorkerConfig {
   const path = `workers[${index}]`;
   const raw = objectAt(value, path);
-  exact(raw, ["id", "url", "expected_device_name", "seconds_per_image", "capabilities", "required", "primary", "enabled"], path);
+  exact(raw, ["id", "url", "expected_device_name", "seconds_per_image", "capabilities", "required", "primary", "enabled", "model_ids", "preferred_model_id", "legacy_priority"], path);
   const url = stringAt(raw.url, `${path}.url`).replace(/\/$/, "");
   const parsed = new URL(url);
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error(`${path}.url must use http or https`);
-  return {
+  const worker: WorkerConfig = {
     id: stringAt(raw.id, `${path}.id`),
     url,
     expectedDeviceName: stringAt(raw.expected_device_name, `${path}.expected_device_name`),
@@ -63,12 +63,31 @@ function workerAt(value: unknown, index: number): WorkerConfig {
     primary: boolAt(raw.primary, `${path}.primary`),
     enabled: boolAt(raw.enabled, `${path}.enabled`),
   };
+  if (raw.model_ids !== undefined) worker.modelIds = stringsAt(raw.model_ids, `${path}.model_ids`);
+  if (raw.preferred_model_id !== undefined) worker.preferredModelId = stringAt(raw.preferred_model_id, `${path}.preferred_model_id`);
+  if (raw.legacy_priority !== undefined) worker.legacyPriority = integerAt(raw.legacy_priority, `${path}.legacy_priority`, 0);
+  return worker;
+}
+
+function modelAt(value: unknown, index: number): ModelConfig {
+  const path = `models[${index}]`;
+  const raw = objectAt(value, path);
+  exact(raw, ["id", "family", "diffusion", "text_encoder", "vae", "capabilities", "max_batch_size"], path);
+  const model: ModelConfig = {
+    id: stringAt(raw.id, `${path}.id`), family: stringAt(raw.family, `${path}.family`),
+    diffusion: stringAt(raw.diffusion, `${path}.diffusion`),
+    capabilities: stringsAt(raw.capabilities, `${path}.capabilities`),
+  };
+  if (raw.text_encoder !== undefined) model.textEncoder = stringAt(raw.text_encoder, `${path}.text_encoder`);
+  if (raw.vae !== undefined) model.vae = stringAt(raw.vae, `${path}.vae`);
+  if (raw.max_batch_size !== undefined) model.maxBatchSize = integerAt(raw.max_batch_size, `${path}.max_batch_size`, 1);
+  return model;
 }
 
 export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const document = parse(source) as unknown;
   const root = objectAt(document, "config");
-  exact(root, ["version", "listen", "database_path", "output_directory", "workers", "timeouts", "limits", "scheduler", "batching", "catalog", "retention", "auth"], "config");
+  exact(root, ["version", "listen", "database_path", "output_directory", "workers", "models", "timeouts", "limits", "scheduler", "batching", "catalog", "retention", "auth"], "config");
   if (root.version !== 1) throw new Error("config.version must be 1");
 
   const listen = objectAt(root.listen, "listen");
@@ -89,6 +108,13 @@ export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env
   exact(auth, ["generation_token_env", "management_token_env"], "auth");
   if (!Array.isArray(root.workers) || root.workers.length === 0) throw new Error("workers must be a non-empty array");
   const workers = root.workers.map(workerAt);
+  const models = root.models === undefined ? undefined : (() => {
+    if (!Array.isArray(root.models)) throw new Error("models must be an array");
+    const result = root.models.map(modelAt);
+    const ids = new Set<string>();
+    for (const model of result) { if (ids.has(model.id)) throw new Error(`duplicate model id ${model.id}`); ids.add(model.id); }
+    return result;
+  })();
   const ids = new Set<string>();
   for (const worker of workers) {
     if (ids.has(worker.id)) throw new Error(`duplicate worker id ${worker.id}`);
@@ -161,6 +187,7 @@ export function parseConfig(source: string, env: NodeJS.ProcessEnv = process.env
     catalog: { refreshOnStart: boolAt(catalog.refresh_on_start, "catalog.refresh_on_start"), retryMs: integerAt(catalog.retry_ms, "catalog.retry_ms", 10), pageSize: integerAt(catalog.page_size, "catalog.page_size", 1) },
     retention: { maxAgeHours, maxTotalBytes: integerAt(retention.max_total_bytes, "retention.max_total_bytes", 1), minAgeHours, sweepIntervalMs: integerAt(retention.sweep_interval_ms, "retention.sweep_interval_ms", 1000) },
     auth: { generationToken: token(generationTokenEnv, "auth.generation_token_env"), managementToken: token(managementTokenEnv, "auth.management_token_env") },
+    ...(models === undefined ? {} : { models }),
   };
 }
 

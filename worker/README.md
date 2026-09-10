@@ -13,3 +13,8 @@ downstream `VAEDecode` and `SaveImage` nodes do not need to change IDs.
 The gateway probes `GatewayMultiSeedStochasticSampler` before enabling the
 `anima-er-sde` adapter. A worker without this node safely remains singleton
 only for `er_sde` workflows.
+
+The node also optionally exposes `/gateway-worker/v1/runtime` and
+`/gateway-worker/v1/memory-operations`. These worker-local endpoints provide
+operation-ID based GPU offload/release status; gateways must probe for them
+before using memory control.

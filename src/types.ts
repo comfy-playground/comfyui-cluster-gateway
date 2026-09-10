@@ -11,6 +11,21 @@ export interface WorkerConfig {
   required: boolean;
   primary: boolean;
   enabled: boolean;
+  /** Model ids this worker is allowed to execute. Empty means legacy mode. */
+  modelIds?: string[];
+  /** Scheduling preference; does not force an eager model load. */
+  preferredModelId?: string;
+  legacyPriority?: number;
+}
+
+export interface ModelConfig {
+  id: string;
+  family: string;
+  diffusion: string;
+  textEncoder?: string;
+  vae?: string;
+  capabilities: string[];
+  maxBatchSize?: number;
 }
 
 export interface BatchingConfig {
@@ -26,6 +41,7 @@ export interface GatewayConfig {
   databasePath: string;
   outputDirectory: string;
   workers: WorkerConfig[];
+  models?: ModelConfig[];
   timeouts: {
     workerRequestMs: number;
     historyPollMs: number;
@@ -143,6 +159,9 @@ export interface WorkerSnapshot {
   ewmaSamples: number;
   lastError: string;
   deviceName: string;
+  currentModelId?: string;
+  preferredModelId?: string;
+  modelStats?: { modelId: string; ewmaMs: number; samples: number }[];
 }
 
 export interface PromptEnvelope extends JsonObject {
